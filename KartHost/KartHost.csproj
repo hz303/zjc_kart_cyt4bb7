@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>disable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <!-- 本工程全部用代码构建界面、不使用 WinForms 设计器，
+         因此关掉「自定义控件属性需可被设计器序列化」这条分析规则 -->
+    <NoWarn>$(NoWarn);WFO1000</NoWarn>
+    <AssemblyName>KartHost</AssemblyName>
+    <RootNamespace>KartHost</RootNamespace>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Version>0.1.0</Version>
+    <Product>卡丁快跑 上位机</Product>
+    <AssemblyTitle>KartHost</AssemblyTitle>
+  </PropertyGroup>
+
+</Project>
