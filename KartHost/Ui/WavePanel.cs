@@ -24,6 +24,22 @@ public sealed class WavePanel : Control
     public double YMin { get; set; } = -100;
     public double YMax { get; set; } = 100;
 
+    /// <summary>
+    /// ★★ 通道名可能整体错位时的红色警示条（null / 空 = 不画）。
+    ///
+    /// 为什么画在**波形里面**而不是顶栏或状态栏：错位这件事的现场表现就是"波形在动、
+    /// 名字也在、单位也对"，看图的人**只会盯着图**。2026-10-14 实测：车端发全量 39 通道、
+    /// 本机档案停在「标定·精简」(18)，于是图例里 `k_v` 那一列读的是 `online`（恒 1）、
+    /// `k_z` 那一列读的是 `rx_age`（**毫秒计数器**，被 100 ms 心跳周期性清零 ⇒ 一条锯齿）。
+    /// 只写进日志的话，人被"增益在抖"这个假象带走了，根本不会去翻日志。
+    /// </summary>
+    public string WarnText { get; set; }
+
+    /// <summary>点了警示条时回调（用来"一键切到匹配的档案"）。为 null 则不可点。</summary>
+    public Action WarnClick { get; set; }
+
+    private Rectangle _warnRect = Rectangle.Empty;
+
     private readonly float[] _v = new float[ChannelStore.Capacity];
     private readonly double[] _t = new double[ChannelStore.Capacity];
     private readonly PointF[] _pts = new PointF[ChannelStore.Capacity + 64];
@@ -60,6 +76,7 @@ public sealed class WavePanel : Control
         if (pw < 20 || ph < 20 || Store == null || Store.Count == 0 || Shown.Count == 0)
         {
             Placeholder(g);
+            DrawWarn(g, pw, ph);          // ★ 没有曲线也要看得见"通道名错位"（这恰恰是它最容易发生的时候）
             return;
         }
 
@@ -81,6 +98,7 @@ public sealed class WavePanel : Control
         DrawTitle(g);
         DrawLegend(g);
         DrawCursor(g, tLeft, tRight, pw, ph);
+        DrawWarn(g, pw, ph);              // 最后画 ⇒ 压在所有东西上面
     }
 
     // ------------------------------------------------------------------
@@ -245,6 +263,40 @@ public sealed class WavePanel : Control
         g.DrawString(Title, f, b, PadLeft, 5);
     }
 
+    /// <summary>
+    /// 红色警示条：**通道名整体错位**时压在波形上方（见 <see cref="WarnText"/>）。
+    /// 顺带把命中矩形记下来，供鼠标点击"一键切到匹配的档案"。
+    ///
+    /// ⚠ **必须自动折行**：面板在 2×2 分图下只有 ~280 逻辑像素宽，而 1.5x DPI 下
+    ///   一个中文字就占 ~19 物理像素 —— 不折行的话尾巴"｜点此切到「卡丁·遥控」"
+    ///   正好被裁掉（2026-10-14 出图时实测到），等于把"怎么办"那半句弄丢了。
+    /// </summary>
+    private void DrawWarn(Graphics g, int pw, int ph)
+    {
+        _warnRect = Rectangle.Empty;
+        if (string.IsNullOrEmpty(WarnText) || pw < 40 || ph < 20) return;
+
+        using var f = new Font("微软雅黑", 9f, FontStyle.Bold);
+        int padX = Dpi.Px(9), padY = Dpi.Px(4);
+        int maxW = pw - Dpi.Px(8);
+
+        // 先按可用宽度量一次「折行后」的尺寸
+        var sz = g.MeasureString(WarnText, f, new SizeF(maxW - padX * 2, 0));
+        int w = Math.Min((int)sz.Width + padX * 2, maxW);
+        int h = Math.Min((int)sz.Height + padY * 2, Math.Max(ph / 2, Dpi.Px(20)));
+        int x = PadLeft + (pw - w) / 2;
+        int y = PadTop + Dpi.Px(4);
+
+        using (var fill = new SolidBrush(Color.FromArgb(232, 82, 82)))            // Theme.Err
+            g.FillRectangle(fill, x, y, w, h);
+        using (var pen = new Pen(Color.FromArgb(255, 236, 180), 1))
+            g.DrawRectangle(pen, x, y, w, h);
+        using (var tb = new SolidBrush(Color.FromArgb(24, 14, 14)))
+            g.DrawString(WarnText, f, tb, new RectangleF(x + padX, y + padY, w - padX * 2, h - padY * 2));
+
+        _warnRect = new Rectangle(x, y, w, h);
+    }
+
     private void DrawLegend(Graphics g)
     {
         using var f = new Font("Consolas", 8f);
@@ -295,8 +347,26 @@ public sealed class WavePanel : Control
     protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
     protected override void OnMouseMove(MouseEventArgs e)
     {
-        _hover = true; _mouseX = e.X; Invalidate(); base.OnMouseMove(e);
+        _hover = true; _mouseX = e.X;
+        // 警示条上给"手型"，否则没人知道它能点
+        if (WarnClick != null && !_warnRect.IsEmpty)
+            Cursor = _warnRect.Contains(e.Location) ? Cursors.Hand : Cursors.Default;
+        Invalidate();
+        base.OnMouseMove(e);
     }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (WarnClick != null && !_warnRect.IsEmpty && _warnRect.Contains(e.Location))
+        {
+            WarnClick();
+            return;
+        }
+        base.OnMouseDown(e);
+    }
+
+    /// <summary>自检用：当前警示条的命中矩形（空 = 没画）。</summary>
+    internal Rectangle WarnRectForTest => _warnRect;
 
     /// <summary>把任意步长吸附到 1 / 2 / 5 × 10^n（刻度才会是整数）</summary>
     private static double NiceStep(double raw)

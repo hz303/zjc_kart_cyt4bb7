@@ -185,8 +185,10 @@ namespace KartHost.Ui
         }
 
         /// <summary>
-        /// 单电机档案：积分角 = mag_sum；换到别的档案这里会变成 -1，只读按钮自动禁用
-        /// （「清空」永远可用 —— 它不依赖通道）。
+        /// 按名字找通道。**只有「单电机验证」档案**才有 mag_* 那套速度积分通道；
+        /// 其余档案（含工程 9 的遥控 / 标定档案）一律落空 ⇒ **把整块面板藏起来**。
+        /// ⚠ 不要让它在别的档案里"显示着但不可用"：一块占 230px、写着"标定不可用/映射 --"的
+        ///   面板只会让人以为"标定坏了"。闭环档案的标定走主界面底部的「实车标定」窗口。
         /// </summary>
         public void ResolveChannels()
         {
@@ -196,6 +198,7 @@ namespace KartHost.Ui
             bool ok = _chSum >= 0;
             _btnLeft.Enabled = _btnRight.Enabled = _btnZero.Enabled = ok;
             _lbNow.Text = ok ? "当前角 --" : "当前档案没有速度积分通道，标定不可用";
+            Visible = ok;
         }
 
         /// <summary>取最近约 0.5 s（50 Hz × 25）的均值 —— 单点值会抖，均值才敢用来标定。</summary>

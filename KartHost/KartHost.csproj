@@ -18,4 +18,11 @@
     <AssemblyTitle>KartHost</AssemblyTitle>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- 路表管理（Ui/RouteManagerForm.cs）走 DAP 自带的虚拟串口灌表 / 读表。
+         车端对应 ins_route/code/route_link.c（UART_0）。版本与
+         A_zjc_project/2.1imu_for_trails_pc 保持一致（那边已经用同一个版本）。 -->
+    <PackageReference Include="System.IO.Ports" Version="10.0.12" />
+  </ItemGroup>
+
 </Project>

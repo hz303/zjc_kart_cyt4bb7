@@ -12,6 +12,85 @@ public enum FrameType : byte
     Nak = 0x05,
     Event = 0x06,
     Command = 0x01,   // 仅下行
+
+    // ---- ★ 路表 dump（车 → PC）：与车端 motor_link.c 的 MOTOR_TYPE_RT_* 一一对应 ----
+    RouteHead = 0x10,   // 32 B 表头
+    RouteData = 0x11,   // first(4) + n(2) + n×12 B 记录
+    RouteEnd = 0x12,    // count(4) + lap_mm(4)
+}
+
+/// <summary>路表 dump 相关的常量（与车端 ins_route.c / motor_link.c 必须一致）</summary>
+public static class RouteProto
+{
+    public const int RecSize = 12;          // int32 x_mm | int32 y_mm | int16 yaw_cdeg | int16 v_cmps
+    public const int HeadBytes = 32;        // magic(4) ver(2) rec_len(2) count(4) ds_mm(4) lap_mm(4)
+                                            // origin_x(4) origin_y(4) origin_yaw(2) flags(2)
+    public const uint Magic = 0x4B525443;   // "CTRK"
+    public const ushort Ver = 1;
+
+    public struct Rec
+    {
+        public int Xmm, Ymm;                 // 相对录制起点的坐标（mm）
+        public short YawCdeg;                // 相对航向（0.01°）
+        public short VCmps;                  // 车速（cm/s）
+        public float X => Xmm / 1000f;
+        public float Y => Ymm / 1000f;
+        public float YawDeg => YawCdeg / 100f;
+        public float VMps => VCmps / 100f;
+    }
+
+    public struct Head
+    {
+        public uint Magic2, Count, DsMm, LapMm;
+        public ushort Ver2, RecLen, OriginYawCdeg, Flags;
+        public int OriginXmm, OriginYmm;
+        public float OriginX => OriginXmm / 1000f;
+        public float OriginY => OriginYmm / 1000f;
+        public float OriginYawDeg => OriginYawCdeg / 100f;
+        public float DsM => DsMm / 1000f;
+        public float LapM => LapMm / 1000f;
+        public bool Full => (Flags & 1) != 0;
+
+        /// <summary>
+        /// ★ 槽头 flags bit1 = 这是一份**巡航记录**（`Cruise` 实际走过的轨迹），
+        /// 不是路表。此时第 4 个字段是**舵机 PWM duty** 而不是车速，
+        /// `DsMm` 存的是**采样周期 ms**、`LapMm` 存的是**总时长 ms**。
+        /// （定义见车端 `ins_route.h` 的 `INS_ROUTE_HDR_FL_LOG`。）
+        /// </summary>
+        public bool IsLog => (Flags & 2) != 0;
+
+        /// <summary>
+        /// ★ 槽头 flags bit2 = 这是一份**转向阶跃测试**记录（内环辨识，见车端 steer_step.h），
+        /// 不是路表也不是巡航记录。12 B 在这份记录里是这样解释的：
+        ///     int32 t_ms | int16 cmd_permill | int16 duty | int16 gz_cdps | int16 v_cmps
+        /// 即第 1 个字段是**毫秒时刻**（不是 x_mm），第 2 个是**施加的归一舵量×1000**
+        /// （不是 y_mm），第 3 个是**陀螺 z ×100**（不是航向），第 4 个还是 duty（在这里是车速 cm/s）。
+        /// ⇒ 画图没有意义，导出时按这三列数字出来就好。
+        /// </summary>
+        public bool IsStep => (Flags & 4) != 0;
+    }
+
+    public static Rec ReadRec(byte[] b, int o) => new()
+    {
+        Xmm = (int)Proto.GetU32(b, o),
+        Ymm = (int)Proto.GetU32(b, o + 4),
+        YawCdeg = (short)Proto.GetU16(b, o + 8),
+        VCmps = (short)Proto.GetU16(b, o + 10),
+    };
+
+    public static Head ReadHead(byte[] b, int o) => new()
+    {
+        Magic2 = Proto.GetU32(b, o),
+        Ver2 = Proto.GetU16(b, o + 4),
+        RecLen = Proto.GetU16(b, o + 6),
+        Count = Proto.GetU32(b, o + 8),
+        DsMm = Proto.GetU32(b, o + 12),
+        LapMm = Proto.GetU32(b, o + 16),
+        OriginXmm = (int)Proto.GetU32(b, o + 20),
+        OriginYmm = (int)Proto.GetU32(b, o + 24),
+        OriginYawCdeg = Proto.GetU16(b, o + 28),
+        Flags = Proto.GetU16(b, o + 30),
+    };
 }
 
 /// <summary>下行命令码</summary>
@@ -24,6 +103,7 @@ public enum Cmd : byte
     SaveParams = 0x05,
     LoadParams = 0x06,
     GetTable = 0x07,
+    RouteDump = 0x08,   // ★ 读路表：车端把整张表分帧 dump 上来（见 FrameType.RouteHead/Data/End）
     RecordStart = 0x10,
     RecordStop = 0x11,
     MotionStart = 0x12,

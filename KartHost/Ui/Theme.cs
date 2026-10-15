@@ -1,3 +1,5 @@
+using System.Drawing.Drawing2D;
+
 namespace KartHost.Ui;
 
 /// <summary>深色主题配色（参考 VOFA+ 的观感）</summary>
@@ -102,5 +104,49 @@ public static class Theme
                 break;
         }
         foreach (Control c in root.Controls) Apply(c);
+    }
+
+    // ===================== 二维轨迹画布（BoardView）用色 =====================
+    // 从 A_zjc_project/3.1imu_trails_mode_pc 的 Ui/Theme.cs 移植，配色改成与本站深色主题一致。
+    public static readonly Color Canvas    = Color.FromArgb(16, 19, 24);     // 画布底（比 Bg 更深，突出轨迹）
+    public static readonly Color Axis      = Color.FromArgb(74, 84, 100);    // 过原点的两条轴
+    public static readonly Color GridDash  = Color.FromArgb(52, 62, 76);    // 罗盘虚线/辅助线
+    public static readonly Color Ccw       = Color.FromArgb(108, 227, 168);  // 逆时针（左转）
+    public static readonly Color Cw        = Color.FromArgb(255, 160, 90);   // 顺时针（右转）
+    public static readonly Color Board     = Color.FromArgb(155, 201, 255);  // 车体轮廓
+    public static readonly Color BoardFill = Color.FromArgb(36, 59, 88);     // 车体填充
+    public static readonly Color Nose      = Color.FromArgb(255, 209, 84);   // 车头三角 / 罗盘指针
+    public static readonly Color Vel       = Color.FromArgb(141, 224, 255);  // 速度矢量
+    public static readonly Color Route     = Color.FromArgb(120, 230, 255);  // 已录路表（预留）
+
+    /// <summary>
+    /// 轨迹按时间着色：早=冷（蓝→青）、晚=暖（橙→红）。
+    /// 用途与参考工程一致 —— 一眼看出"轨迹是从什么时候开始漂的"（冷色段是刚起步，暖色段是末端）。
+    /// </summary>
+    public static Color TimeColor(float f)
+    {
+        f = Math.Clamp(f, 0f, 1f);
+        if (f < 0.45f) return FromHsv(0.58f - 0.13f * (f / 0.45f), 0.80f, 1.00f);          // 蓝 -> 青
+        if (f < 0.75f) return FromHsv(0.45f - 0.37f * ((f - 0.45f) / 0.30f), 0.85f, 1.00f); // 青 -> 橙
+        return FromHsv(0.08f * (1f - (f - 0.75f) / 0.25f), 0.90f, 1.00f);                    // 橙 -> 红
+    }
+
+    /// <summary>界面字体工厂（点值，**不要**再乘 DPI；GDI+ 会自己按缩放放大）</summary>
+    public static Font F(float pt, FontStyle st = FontStyle.Regular) => new("Segoe UI", pt, st);
+
+    /// <summary>等宽字体（数字对齐用）</summary>
+    public static Font FM(float pt, FontStyle st = FontStyle.Regular) => new("Consolas", pt, st);
+
+    /// <summary>圆角矩形路径（画车体用；用完要 Dispose）</summary>
+    public static GraphicsPath RoundRect(Rectangle r, int radius)
+    {
+        var p = new GraphicsPath();
+        int d = Math.Max(1, Math.Min(radius * 2, Math.Min(r.Width, r.Height)));
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
     }
 }

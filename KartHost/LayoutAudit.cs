@@ -90,6 +90,14 @@ public static class LayoutAudit
 
         foreach (Control c in parent.Controls)
         {
+            // ★ 隐藏的控件（包括整块面板被隐藏时它里面的所有东西）**不参与判定**：
+            //   ① 它不显示，屏幕上看不到任何"被夹住"的东西 —— 体检的目的是"用户看得见的坏样子"；
+            //   ② WinForms **不会给隐藏控件做布局**，它的 ClientSize 还停在构造时的默认值
+            //      （Panel 默认 200 宽），拿它当"父可视宽"去量里面的标签，只会报一串假越界。
+            //      （2026-10-13 把「行程标定」面板在本档案下隐藏时就踩了这条。）
+            //   ⚠ 千万别反过来拿它当挡箭牌：可见控件一个都不会被跳过。
+            if (!c.Visible) continue;
+
             if (IsTextControl(c) && !string.IsNullOrEmpty(c.Text))
             {
                 var pref = c.PreferredSize;

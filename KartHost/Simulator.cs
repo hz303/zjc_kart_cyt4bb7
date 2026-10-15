@@ -30,6 +30,9 @@ public sealed class Simulator : IDisposable
     private float[] _ch = new float[Defaults.ChannelNames.Length];   // 档案一变就重分配（见 BuildTelemetry）
     private double _mSum;                                            // 角速度积分（mrad）
     private readonly Random _rnd = new(20260917);
+    private string _warnedNoFill;                                    // "这个档案没有造数分支"只提示一次
+    /// <summary>「转向闭环」那套 26 通道布局的暂存区（KartRC / Calib 先算到这里再搬家）。</summary>
+    private readonly float[] _clBuf = new float[26];
 
     // ---- 模拟物理状态（独立字段，不要借用 _ch 存状态）----
     private double _t;
@@ -38,6 +41,21 @@ public sealed class Simulator : IDisposable
     private double _lastSendT;
     private double _lastCmdT;                   // 最近一次收到下行帧的时刻（秒）
     private bool   _everRx;                     // 上位机开口说过话没有
+
+    // ---- 惯导 + 路表档案专用状态（工程 8）----
+    private double _insX, _insY, _insYaw, _insDist;   // 模拟车的位姿（x 右 / y 前 / yaw 度 / 里程 m）
+    // ★ 路表的【起点车体系】基准（与车端 ins_route.c 的 origin_x/y/yaw 同义）
+    private double _rtX0, _rtY0, _rtYaw0;
+    private float  _srvApplied;                       // 本拍舵量（考虑使能与否）
+    private int    _insSeq;                           // 采样序号（应匀速增长）
+    private bool   _zeroPrev, _routePrev, _magcalPrev;// 三个"边沿命令"的上一拍状态
+    private bool   _routeRunning, _magDone;
+    private double _routeNextAt;                      // 下一点的里程阈值
+    private readonly List<double> _routeX = new();    // 模拟录到的路表（供日志/自检断言"非空"）
+    private readonly List<double> _routeY = new();
+
+    internal int      InsRoutePointCount => _routeX.Count;
+    internal bool     InsRouteRunning    => _routeRunning;
 
 
     public Simulator()
@@ -115,8 +133,8 @@ public sealed class Simulator : IDisposable
             _t += dt;
 
             // ---- 按 telemetry_hz 推遥测（限频是车端责任，PC 端不做节流）----
-            // 单电机 / 双电机档案没有 telemetry_hz 这个参数，直接给 50 Hz
-            float hz = (Defaults.IsMotor || Defaults.IsDualMotor) ? 50f : Math.Clamp(Prm("telemetry_hz"), 5f, 200f);
+            // 单电机 / 双电机 / 转向闭环档案没有 telemetry_hz 这个参数，直接给 50 Hz
+            float hz = Defaults.IsClosedLoop ? 50f : Math.Clamp(Prm("telemetry_hz"), 5f, 200f);
             if (now - _lastSendT >= 1.0 / hz)
             {
                 _lastSendT = now;
@@ -216,6 +234,19 @@ public sealed class Simulator : IDisposable
                 Ack(Cmd.GetTable, token);
                 break;
 
+            case Cmd.RouteDump:
+                // ★ 模拟车端的「读路表」：把上面 RecTbl 录到的那张表按真实协议分帧发出去。
+                //   首尾各 1 帧 + 每 RtChunk 点 1 帧，与车端 motor_rt_tick() 同构。
+                if (_routeX.Count < 2)
+                {
+                    Log?.Invoke("模拟车端：路表为空（先在面板上喂 ins_route=1 让它录一段）");
+                    Nak(Cmd.RouteDump, token, 2);
+                    break;
+                }
+                Ack(Cmd.RouteDump, token);
+                SendRouteDump();
+                break;
+
             case Cmd.SaveParams:
                 foreach (var p in _params) p.Dirty = false;
                 Log?.Invoke("参数已保存到 Flash");
@@ -281,6 +312,62 @@ public sealed class Simulator : IDisposable
         SendFrame((byte)FrameType.Ack, pl);
     }
 
+    private void Nak(Cmd cmd, ushort token, byte err)
+    {
+        var pl = new byte[4];
+        Proto.PutU16(pl, 0, token);
+        pl[2] = (byte)cmd;
+        pl[3] = err;
+        SendFrame((byte)FrameType.Nak, pl);
+    }
+
+    /// <summary>模拟车端把路表按协议 dump 出去（车端 motor_rt_tick() 的镜像）</summary>
+    private void SendRouteDump()
+    {
+        const int Chunk = 64;                       // = 车端 MOTOR_RT_CHUNK
+
+        // --- 表头 32 B（字段偏移与车端 rt_head_t 逐项一致）---
+        var hd = new byte[RouteProto.HeadBytes];
+        Proto.PutU32(hd, 0, RouteProto.Magic);
+        Proto.PutU16(hd, 4, RouteProto.Ver);
+        Proto.PutU16(hd, 6, RouteProto.RecSize);
+        Proto.PutU32(hd, 8, (uint)_routeX.Count);
+        Proto.PutU32(hd, 12, 50u);                 // ds_mm（模拟车端用 0.05 m）
+        double lap = _routeX.Count * 0.05;
+        Proto.PutU32(hd, 16, (uint)(lap * 1000));
+        Proto.PutU32(hd, 20, 0u);                  // origin_x_mm
+        Proto.PutU32(hd, 24, 0u);                  // origin_y_mm
+        Proto.PutU16(hd, 28, 0);                   // origin_yaw_cdeg
+        Proto.PutU16(hd, 30, (ushort)(_routeX.Count >= 1500 ? 1 : 0));
+        SendFrame((byte)FrameType.RouteHead, hd);
+
+        // --- 数据块 ---
+        for (int first = 0; first < _routeX.Count; first += Chunk)
+        {
+            int n = Math.Min(Chunk, _routeX.Count - first);
+            var pl = new byte[6 + n * RouteProto.RecSize];
+            Proto.PutU32(pl, 0, (uint)first);
+            Proto.PutU16(pl, 4, (ushort)n);
+            for (int k = 0; k < n; k++)
+            {
+                int o = 6 + k * RouteProto.RecSize;
+                Proto.PutU32(pl, o, (uint)(int)Math.Round(_routeX[first + k] * 1000.0));
+                Proto.PutU32(pl, o + 4, (uint)(int)Math.Round(_routeY[first + k] * 1000.0));
+                Proto.PutU16(pl, o + 8, 0);        // yaw_cdeg（模拟侧不记航向）
+                Proto.PutU16(pl, o + 10, 0);       // v_cmps
+            }
+            SendFrame((byte)FrameType.RouteData, pl);
+        }
+
+        // --- 结束帧 ---
+        var ed = new byte[8];
+        Proto.PutU32(ed, 0, (uint)_routeX.Count);
+        Proto.PutU32(ed, 4, (uint)(lap * 1000));
+        SendFrame((byte)FrameType.RouteEnd, ed);
+
+        Log?.Invoke($"模拟车端：已 dump 路表 {_routeX.Count} 点（{(_routeX.Count + Chunk - 1) / Chunk + 2} 帧）");
+    }
+
     private void SendParamValue(byte id, float v)
     {
         var pl = new byte[5];
@@ -319,9 +406,24 @@ public sealed class Simulator : IDisposable
         var ch = _ch;
         Array.Clear(ch, 0, ch.Length);
 
+        // ⚠⚠ **每个档案都必须有自己的分支**。最后那支 FillKart 只认"卡丁车"那套下标，
+        //   别的档案落进去就是"数据一套、通道名另一套"：轻则图例/数值框全错位
+        //   （2026-10-13 现场：遥控档案的"速度"格读到了 ch15 = 换向次数），
+        //   重则**越界**（标定档案只有 16 个通道，FillKart 会写到 ch[30] 直接抛异常）。
+        //   ⇒ 兜底换成"全 0 + 日志"：宁可显示"没数据"，也不要显示"错数据"。
+        //   ⚠ 新增档案时，这里和 Defaults.ValueBoxes() 必须同时加一支（SelfTest 会挨个跑一遍）。
         if (Defaults.IsMotor) FillMotor(ch);
         else if (Defaults.IsDualMotor) FillDualMotor(ch);
-        else FillKart(ch);
+        else if (Defaults.IsSteerLoop) FillSteerLoop(ch);
+        else if (Defaults.IsInsRoute) FillInsRoute(ch);
+        else if (Defaults.IsKartRC) FillKartRC(ch);
+        else if (Defaults.IsCalib) FillCalib(ch);
+        else if (Defaults.IsKart) FillKart(ch);
+        else if (_warnedNoFill != Defaults.ProfileDisplayName)
+        {
+            _warnedNoFill = Defaults.ProfileDisplayName;
+            Log?.Invoke($"[模拟] 档案「{_warnedNoFill}」没有专用造数分支 —— 该档案全 0（请在 Simulator 里补一支）");
+        }
 
         // ---- 组帧 ----
         int cnt = ch.Length;
@@ -329,7 +431,9 @@ public sealed class Simulator : IDisposable
         var p = new byte[pl];
         Proto.PutU16(p, 0, (ushort)(FramesSent & 0xFFFF));
         Proto.PutU32(p, 2, (uint)(_t * 1000));
-        Proto.PutU16(p, 6, 0x0FFF);                 // VALID_MASK：通道数按档案给
+        // VALID_MASK 是**哨兵值**（全 1 = 全部有效），不是逐通道位图 —— 通道数已超过 16，
+        // 位图根本表达不下。车端 motor_link.c 也发 0xFFFF，这里跟它对齐（以前发 0x0FFF 是笔误）。
+        Proto.PutU16(p, 6, 0xFFFF);
         Proto.PutU16(p, 8, (ushort)cnt);
         for (int c = 0; c < cnt; c++) Proto.PutF32(p, 10 + c * 4, ch[c]);
         return p;
@@ -425,6 +529,11 @@ public sealed class Simulator : IDisposable
     private float  _uPrevL, _uPrevR;                         // 上一拍输出（换向检测用）
     private int    _flipL, _flipR;                           // 换向丢拍累计
 
+    // ---- 转向闭环档案的物理状态（转向位置环，独立于后轮那套）----
+    private double _steerAng;                                // 转向实测转角（单位: 方向盘度, 向右为正）
+    private float  _steerApplied;                            // 目标斜坡之后的实际施加目标（度）
+    private bool   _steerEnPrev;                             // 上一拍的内环使能（判 0→1 上升沿）
+
     /// <summary>
     /// 双电机速度环档案：照 speed_loop 的 LQI 语义造数。
     ///   u = u_ff + k_v·(r−v) + k_z·z，u_ff = r/K + u0·sign(r)，z 为条件积分；
@@ -516,6 +625,309 @@ public sealed class Simulator : IDisposable
         ch[17] = (float)((_t - _lastCmdT) * 1000.0); // rx_age ms
         ch[18] = Enable;                           // enable 位图
         ch[19] = 0f;                               // safety 位图（模拟器不产生保护事件）
+    }
+
+    /// <summary>
+    /// 转向闭环档案（工程 7.steer_loop_wifi_cyt4bb7）：
+    /// 后轮速度环与「双电机」档案**逐位一致**（直接复用 FillDualMotor），
+    /// 额外补 20~25 的转向组 —— 转向位置环 + 绝对角度编码器。
+    ///
+    /// 车端事实（对应 steer_ctrl.c / steer_abs.c）：
+    ///   · 位置式 PID（积分**不乘 dt**，同北极星队 kart_pid.c 口径）
+    ///   · 输出是**带符号 duty**（−10000~10000）
+    ///   · 绝对角 raw 0~4095；delta 是"已减中位、已解环绕"的计数
+    ///   · steer_status 的 bit0 = 自检通过（0 = 失败）
+    /// 这里只做一阶速率受限的简化模型，够跑通界面与自检，不追求复刻静摩擦等细节。
+    /// </summary>
+    private void FillSteerLoop(float[] ch)
+    {
+        FillDualMotor(ch);                         // 0~19 与双电机档案完全一致
+
+        const float dt      = 0.02f;
+        const float vMaxDeg = 90f;                 // 满偏时机构角速度上限（度/秒）
+
+        bool  en     = Prm("steer_en") > 0.5f;
+        float kp     = Prm("steer_kp");
+        float u0     = Prm("steer_u0");
+        float db     = Math.Max(0f, Prm("steer_db"));
+        float slew   = Math.Max(0f, Prm("steer_slew"));
+        float limit  = Math.Max(1f, Prm("steer_lim"));
+        float outMax = Math.Clamp(Prm("steer_umax"), 0f, 10000f);
+        if (outMax <= 0f) outMax = 9000f;      // 与车端 STEER_U_MAX_DEFAULT 同档（2026-10-15 起 9000）
+
+        // ★ 0→1 上升沿：用"当前实测角"重置目标 —— 复刻固件 steer_ctrl_set_angle_enable() 的行为。
+        //   车端参数变量就是固件变量（`&steer.target_delta`），所以这里直接改参数值，与真机一致：
+        //   **先给目标再使能，那个目标会被吞掉** —— 这是防大跳变的保护，不是 bug。
+        if (en && !_steerEnPrev)
+        {
+            var tgt = _params.Find(x => x.Name == "steer_tgt");
+            if (tgt != null) tgt.Value = (float)_steerAng;
+            _steerApplied = (float)_steerAng;
+        }
+        _steerEnPrev = en;
+
+        // ---- 目标软限位（每拍补夹）+ 斜坡（与固件 update 里"目标处理在门控之前"一致）----
+        //   ⚠ 分清两个 target：targetRaw 是"上位机写的值（夹过限位）"，对应固件的 steer.target_delta；
+        //      `_steerApplied` 是**实际施加**的目标（软限位夹紧 + 斜坡之后）= 固件的 steer.applied_delta。
+        //   ★★ 2026-10-14 起遥测 ch[20] 发的是 `_steerApplied`（照队友把 Servo_Target_Applied_Deg
+        //      单独导出去的做法）：斜坡开着时若发命令本身，波形上是一条干净阶跃，
+        //      会让人把"斜坡滞后"算到机械/增益头上。`steer_slew = 0`(默认) 时两者相等。
+        float targetRaw = Math.Clamp(Prm("steer_tgt"), -limit, limit);
+        float target    = targetRaw;
+
+        float u = 0f;
+        if (en)
+        {
+            if (slew > 0f)
+            {
+                float lim = slew * dt;
+                if (target > _steerApplied + lim) target = _steerApplied + lim;
+                if (target < _steerApplied - lim) target = _steerApplied - lim;
+            }
+            _steerApplied = target;
+
+            float e = target - (float)_steerAng;
+
+            // 越限保护：实测已超软限位、且误差还指向限位方向 -> 本拍不出力
+            if (((_steerAng >  limit) && (e > 0f)) ||
+                ((_steerAng < -limit) && (e < 0f))) e = 0f;
+
+            // 误差死区
+            if (e < db && e > -db) e = 0f;
+
+            // ★ 位置环 + 静摩擦前馈（2026-10-07 换的控制律）: u = kp*e + u0*sign(e)
+            u = kp * e + (e > 0f ? u0 : (e < 0f ? -u0 : 0f));
+            if (u > outMax) u = outMax; else if (u < -outMax) u = -outMax;
+
+            // 被控对象：把 duty 当速度指令，推到限速就停（静摩擦细节不复刻，够跑界面与自检）
+            float v = u / outMax * vMaxDeg;
+            _steerAng += v * dt;
+            if (_steerAng >  32f) _steerAng =  32f;
+            if (_steerAng < -32f) _steerAng = -32f;
+        }
+        else
+        {
+            _steerApplied = targetRaw;             // 不使能 -> 斜坡状态跟住目标，输出 0
+        }
+
+        // raw 映射：deg = -(raw - 2157)/50.08  =>  raw = 2157 - deg*50.08
+        int raw = (int)Math.Round(2157.0 - _steerAng * 50.08);
+        raw = ((raw % 4096) + 4096) % 4096;
+
+        ch[20] = _steerApplied;                    // steer_tgt：★ 实际施加目标（软限位+斜坡之后），非命令
+        ch[21] = (float)_steerAng;                 // steer_delta（度）
+        ch[22] = u;                                // steer_u（带符号 duty）
+        ch[23] = raw;                              // steer_raw 0~4095
+        ch[24] = en ? 1f : 0f;                     // steer_en
+        ch[25] = 1f;                               // steer_status：bit0=1 = 自检通过
+    }
+
+    /// <summary>
+    /// 卡丁·遥控档案（工程 9 全量 39 通道）：0~25 与「转向闭环」**逐位一致**（工程 9 = 工程 7 + 遥控），
+    /// 所以直接复用 FillSteerLoop；26~36 是遥控组；37~38 是增益回读。
+    ///
+    /// ⚠ 遥控组（26~36）一律填 0：模拟器**不模拟接收机**（没有 SBUS、没有 CH5/CH6 开关），
+    ///   编一组"看起来在接管"的假值比不填更容易误导现场 —— 0 = 没插接收机 / 遥控 OFF，
+    ///   与车端 `remote_ctrl` 的 FAILSAFE 语义一致（`rc_frames` 不涨就是没在发）。
+    ///
+    /// ★ 回读的 k_v / k_z 填的是**模拟参数面板里当前的值** —— 真机上这两个通道就是这么来的
+    ///   （`spd_g.k_v` = 上位机下发、车端钳位之后的值）。这样在模拟器里拖滑条，
+    ///   回读通道会跟着动，"滑条值 != 生效值"这件事在**没有车**的时候也能看见。
+    /// </summary>
+    private void FillKartRC(float[] ch)
+    {
+        // 39 = 26(转向闭环) + 11(遥控组) + 2(增益回读)。表变了就当场说清楚，别静默错位。
+        if (ch.Length < 39)
+        {
+            Array.Clear(ch, 0, ch.Length);
+            Log?.Invoke($"[模拟] KartRC 档案通道数异常（{ch.Length} < 39）—— 本帧全 0");
+            return;
+        }
+
+        FillSteerLoop(ch);                                     // 0~25
+
+        // 26~36：没有接收机就是 0。⚠ 只清这一段，别顺手把 37/38 的回读值也清了。
+        for (int i = 26; i <= 36 && i < ch.Length; i++) ch[i] = 0f;
+
+        ch[37] = Prm("k_v");                                   // CH_K_V 本拍生效的比例增益
+        ch[38] = Prm("k_z");                                   // CH_K_Z 本拍生效的积分增益
+    }
+
+    /// <summary>
+    /// 标定·精简档案（工程 9 的 `tel_sel = 1`，18 通道）：就是"转向闭环"那套状态
+    /// **按车端 CT_* 的 18 个下标重新排一遍**。
+    ///
+    /// 先算进 26 长的暂存区再搬家，而不是另写一份动力学 —— 这样两条档案的仿真
+    /// （K·u 一阶跟随、条件积分抗饱和、换向丢拍）**永远是同一份代码**，不会各自漂移。
+    /// ⚠ index 必须与车端 motor_link.h 第五节的 CT_* 一致，改一处就要改两处。
+    /// </summary>
+    private void FillCalib(float[] ch)
+    {
+        if (ch.Length < 18)
+        {
+            Array.Clear(ch, 0, ch.Length);
+            Log?.Invoke($"[模拟] Calib 档案通道数异常（{ch.Length} < 18）—— 本帧全 0");
+            return;
+        }
+
+        FillSteerLoop(_clBuf);                             // 26 长暂存：0~25 那套布局
+
+        ch[0]  = _clBuf[0];                                // CT_TARGET_L   目标转速 L(rps)
+        ch[1]  = _clBuf[1];                                // CT_V_L        实测转速 L
+        ch[2]  = _clBuf[2];                                // CT_U_L        输出占空比 L(%)
+        ch[3]  = _clBuf[3];                                // CT_TARGET_R
+        ch[4]  = _clBuf[4];                                // CT_V_R
+        ch[5]  = _clBuf[5];                                // CT_U_R
+        ch[6]  = _clBuf[20];                               // CT_STEER_TGT  目标转角(°)
+        ch[7]  = _clBuf[21];                               // CT_STEER_DELTA 实测转角(°)
+        ch[8]  = _clBuf[22];                               // CT_STEER_U    舵机输出(duty)
+        ch[9]  = _clBuf[16];                               // CT_ONLINE     链路在线
+        ch[10] = _clBuf[18];                               // CT_ENABLE     使能位图
+        ch[11] = _clBuf[19];                               // CT_SAFETY     保护位图
+        ch[12] = _clBuf[24];                               // CT_STEER_EN   转向内环使能
+        ch[13] = _clBuf[25];                               // CT_STEER_ST   舵机状态(bit0 自检 / bit1,2 锁存)
+        ch[14] = 0f;                                       // CT_OL_EN      模拟器不模拟开环模式
+        ch[15] = 0f;                                       // CT_RESV0      预留
+        ch[16] = Prm("k_v");                               // CT_K_V        本拍生效的比例增益
+        ch[17] = Prm("k_z");                               // CT_K_Z        本拍生效的积分增益
+    }
+
+    /// <summary>
+    /// 自检用：按**当前档案**造一帧通道值（不发送、不推进时间、不改状态机）。
+    /// 用来断言"每个档案都有专用造数分支、且长度对得上" —— 这类错位不抛异常时最难查。
+    /// </summary>
+    internal float[] TestFillOnce()
+    {
+        var buf = new float[Defaults.ChannelNames.Length];
+        if (Defaults.IsMotor) FillMotor(buf);
+        else if (Defaults.IsDualMotor) FillDualMotor(buf);
+        else if (Defaults.IsSteerLoop) FillSteerLoop(buf);
+        else if (Defaults.IsInsRoute) FillInsRoute(buf);
+        else if (Defaults.IsKartRC) FillKartRC(buf);
+        else if (Defaults.IsCalib) FillCalib(buf);
+        else FillKart(buf);
+        return buf;
+    }
+
+    // ==================================================================
+    // 惯导 + 路表档案（工程 8.ins_route_cyt4bb7，C 车）
+    //
+    // 这一段刻意**不用随机游走糊一条假曲线**，而是把"左右轮实测转速"当成真的车速去积分：
+    //      v = (v_l + v_r)/2 × 米每转          ω = (v_r − v_l) / 轮距
+    //      yaw += ω·dt  →  x += −sin(yaw)·ds  →  y += cos(yaw)·ds
+    // 这样拖 target_l / target_r 滑条就能看到车真的走/转，**和车端 ins_odom.c 是同一套公式**，
+    // 也才能用自检断言"路表点数是真在长、位姿是真在动"。
+    // ==================================================================
+    private void FillInsRoute(float[] ch)
+    {
+        FillDualMotor(ch);                         // 0~19 与双电机档案完全一致（含 5ms 口径的轮速）
+
+        const double dt = 0.02;                    // 模拟车端 50 Hz 步进
+        const double WHEELBASE = 0.16;             // m，小模型车近似轮距（只影响模拟转弯半径，不影响真机）
+
+        // ---------- 舵机（20~22）----------
+        bool  srvEn = Prm("srv_en") > 0.5f;
+        float norm  = srvEn ? Math.Clamp(Prm("srv_norm"), -1f, 1f) : 0f;
+        _srvApplied = norm;
+
+        // duty 口径与 steer_srv.h 一致：中位 2420；**左右半程不对称**（左 240 / 右 260）
+        float duty = norm >= 0f ? 2420f + norm * 240f : 2420f + norm * 260f;
+        ch[20] = _srvApplied;
+        ch[21] = duty;
+        ch[22] = srvEn ? 1f : 0f;
+
+        // ---------- 三个边沿命令（复刻车端"只在 0→1 / 1→0 那一拍动手"的语义）----------
+        bool zeroNow   = Prm("ins_zero")   > 0.5f;
+        bool routeNow  = Prm("ins_route")  > 0.5f;
+        bool magcalNow = Prm("ins_magcal") > 0.5f;
+
+        if (zeroNow && !_zeroPrev)
+        {
+            _insX = _insY = _insYaw = _insDist = 0.0;
+            _routeX.Clear(); _routeY.Clear(); _routeNextAt = 0;
+        }
+        _zeroPrev = zeroNow;
+
+        if (routeNow != _routePrev)                // 0→1 开、1→0 停
+        {
+            _routeRunning = routeNow;
+            if (routeNow)
+            {
+                // 起点一定是第 0 点（车端 ins_route_start 就是这么做的）。
+                // ★ 必须先锁存起点位姿：车端存的是【相对起点】的坐标，
+                //   所以第 0 点恒为 (0,0)。若直接存世界坐标，上位机就无法把
+                //   路表和实时轨迹叠在一起比较（两者原点不同）。
+                _routeX.Clear(); _routeY.Clear();
+                _rtX0 = _insX; _rtY0 = _insY; _rtYaw0 = _insYaw;
+                _routeX.Add(0.0); _routeY.Add(0.0);
+                _routeNextAt = _insDist + 0.05;    // 车端阈值 INS_ROUTE_DIST_THRESH
+            }
+        }
+        _routePrev = routeNow;
+
+        if (magcalNow != _magcalPrev)              // 0→1 开始、1→0 结算
+        {
+            if (!magcalNow) _magDone = true;       // 结算过了 -> 磁修正生效（车端置 INS_ST_MAG_CAL_DONE）
+        }
+        _magcalPrev = magcalNow;
+
+        // ---------- 惯导：用实测轮速积分 ----------
+        float mpm    = Prm("ins_mpm");
+        if (mpm <= 0f) mpm = 1f;
+        bool  odomEn = Prm("ins_odom_en") > 0.5f;
+
+        double vL = ch[1] * mpm;                   // m/s
+        double vR = ch[4] * mpm;
+        double v  = (vL + vR) * 0.5;
+        double w  = (vR - vL) / WHEELBASE;         // rad/s
+        double ds = v * dt;
+
+        if (odomEn)
+        {
+            _insYaw += w * 180.0 / Math.PI * dt;
+            double rad = _insYaw * Math.PI / 180.0;
+            _insX    += -Math.Sin(rad) * ds;
+            _insY    +=  Math.Cos(rad) * ds;
+            _insDist += Math.Abs(ds);
+        }
+
+        // ---------- 路表录制（阈值 0.05 m，与车端一致）----------
+        if (_routeRunning && _insDist >= _routeNextAt)
+        {
+            {
+                double a = -_rtYaw0 * Math.PI / 180.0;      // 车端：x' = cos(a0)dx + sin(a0)dy
+                double c = Math.Cos(a), sn = Math.Sin(a);
+                double dx = _insX - _rtX0, dy = _insY - _rtY0;
+                _routeX.Add(c * dx + sn * dy);
+                _routeY.Add(-sn * dx + c * dy);
+            }
+            _routeNextAt = _insDist + 0.05;
+            if (_routeX.Count >= 1500) _routeRunning = false;   // 车端 MAX_POINTS，录满即停
+        }
+
+        // ---------- 填通道（23~31）----------
+        // 姿态：给一点小噪声，静态时看着像真的（roll/pitch 只在坡道/侧倾时才有意义）
+        float roll  = (float)(Math.Sin(_t * 0.7) * 0.8 + (_rnd.NextDouble() - 0.5) * 0.15);
+        float pitch = (float)(Math.Sin(_t * 0.5) * 0.6 + (_rnd.NextDouble() - 0.5) * 0.15);
+
+        ch[23] = roll;
+        ch[24] = pitch;
+        ch[25] = (float)(w * 180.0 / Math.PI + (_rnd.NextDouble() - 0.5) * 0.05);  // 陀螺 Z（°/s）
+        ch[26] = (float)_insX;
+        ch[27] = (float)_insY;
+        ch[28] = (float)_insYaw;
+        ch[29] = (float)_insDist;
+
+        // 状态位图（与车端 main_cm7_0.c 的打包方式逐位一致；**用位或，不是加法**）
+        uint fl = 0;
+        if (odomEn)             fl |= 0x01;        // bit0 已就绪
+        if (_magDone)           fl |= 0x02;        // bit1 磁已标定
+        if (Math.Abs(v) < 0.01) fl |= 0x04;        // bit2 静止
+        if (_routeRunning)      fl |= 0x10;        // bit4 路表录制中
+        if (_routeX.Count >= 1500) fl |= 0x20;     // bit5 路表满
+        if (!odomEn)            fl |= 0x80;        // bit7 告警（推算被关掉了）
+        ch[30] = fl;
+        ch[31] = _insSeq++;                        // 采样序号：应匀速增长（上位机用它统计丢帧）
     }
 
     private void FillKart(float[] ch)

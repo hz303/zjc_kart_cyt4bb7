@@ -3,8 +3,9 @@
 #  原则：只提交源码与工程文件；编译产物、用户设置、工具输出一律不入库。
 # ===================================================================
 
-# ---------- IAR 编译产物 ----------
+# ---------- IAR ----------
 # 这两个目录是本仓库最大的负担：Debug_m7_0 单个就有 ~960 MB（BrowseInfo/List/Obj）
+# ⚠ 它们**在两层**出现：iar/ 下和 iar/project_config/ 下（后者是各核自己的构建目录）
 Debug_m7_0/
 Debug_m7_1/
 settings/          # IAR 的窗口布局 / 断点等用户级状态
@@ -12,6 +13,7 @@ settings/          # IAR 的窗口布局 / 断点等用户级状态
 *.pbw              # BrowseInfo 数据库
 *.dep
 *.cspy.bat
+*.bak              # 手改库文件前留的备份（git 本身就是历史）
 
 # ---------- .NET / C# ----------
 bin/
@@ -24,7 +26,16 @@ _*.txt             # 带下划线开头的是临时抓包/日志
 selftest*.txt
 form.png
 form.layout.txt
+*.layout.txt       # LayoutAudit 的体检报告
 *.csv
+shot_*.png         # --shot-form 出图
+crop_*.png
+form*.png
+主屏-导出CSV按钮.png
+
+# ---------- Python ----------
+__pycache__/
+*.pyc
 
 # ---------- 系统 ----------
 Thumbs.db
@@ -32,3 +43,4 @@ desktop.ini
 .DS_Store
 
 # 注意：libraries/ 下的 *.a（预编译库，共 5 个）必须保留，别加 *.a 规则。
+# 注意：libraries/ 下的 *.txt（LICENSE / Readme / 外设文件说明）也要保留，别加 *.txt 规则。
