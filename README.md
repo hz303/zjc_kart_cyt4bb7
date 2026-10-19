@@ -42,18 +42,25 @@ zjc_kart_cyt4bb7/
 │       ├── user/                   main_cm7_0.c、cm7_0_isr.c（CM7_1 为空工程）
 │       └── iar/                    cyt4bb7.eww + project_config/*.ewp
 │
+├── 10.ins_route_rc_cyt4bb7/        车端固件 —— 工程 10（工程 9 复制 + 引脚二次移植）
+│   ├── 00-工程9-遥控与引脚移植说明.md  ★ 引脚总表（以其中「按队友 ca55f2b 换脚」修订为准）
+│   ├── 00-README.md / 01-上电标定卡.md / 02-转向标定卡.md
+│   ├── build.bat / libraries/ / tools/
+│   └── steer_loop_wifi/            IAR 工程本体（结构同工程 9）
+│
 └── KartHost/                       PC 上位机（C# .NET 9 WinForms）
     ├── README.md                   上位机说明
     ├── *.cs / Ui/                  源码（协议层 / 链路层 / 波形 / 参数面板 / 标定窗 / 自检）
     └── KartHost.csproj
 ```
 
-### 两个车端版本的关系
+### 三个车端版本的关系
 
 | 目录 | 版本 | 内容 |
 |---|---|---|
 | `speed_loop_wifi_cyt4bb7/` | **工程 7** | 双电机速度环预研（台架验证用） |
 | `9.steer_rc_wifi_cyt4bb7/` | **工程 9** | **工程 7 + 队友最新线束引脚 + 遥控（逐飞 UART 接收机，不依赖 WiFi）+ 转向位置环** |
+| `10.ins_route_rc_cyt4bb7/` | **工程 10** | **工程 9 复制 + 三路驱动电机按队友 `Karting-Project` ca55f2b 全部换脚**（转向 → P05_0/P05_1），遥控/编码器/角度传感器不动 |
 
 > ⚠ **引脚表以版本各自文档为准。** 工程 9 把三路驱动电机的引脚**整体轮转**过一遍，
 > `9.steer_rc_wifi_cyt4bb7/00-工程9-遥控与引脚移植说明.md` 的引脚总表**取代**下面工程 7 那张表 ——

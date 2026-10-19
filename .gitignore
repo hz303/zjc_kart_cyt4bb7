@@ -8,12 +8,16 @@
 # ⚠ 它们**在两层**出现：iar/ 下和 iar/project_config/ 下（后者是各核自己的构建目录）
 Debug_m7_0/
 Debug_m7_1/
-settings/          # IAR 的窗口布局 / 断点等用户级状态
-*.sim              # IAR 仿真器状态
-*.pbw              # BrowseInfo 数据库
+# IAR 的窗口布局 / 断点等用户级状态（git 不支持行内注释，注释必须单独成行）
+settings/
+# IAR 仿真器状态
+*.sim
+# BrowseInfo 数据库
+*.pbw
 *.dep
 *.cspy.bat
-*.bak              # 手改库文件前留的备份（git 本身就是历史）
+# 手改库文件前留的备份（git 本身就是历史）
+*.bak
 
 # ---------- .NET / C# ----------
 bin/
