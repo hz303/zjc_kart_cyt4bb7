@@ -18,6 +18,8 @@ settings/
 *.cspy.bat
 # 手改库文件前留的备份（git 本身就是历史）
 *.bak
+# .bak_ins / .bak_diag / .bak_route 等带后缀的备份变体
+*.bak_*
 
 # ---------- .NET / C# ----------
 bin/
