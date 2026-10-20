@@ -75,7 +75,7 @@ extern volatile float   spd_tel_period;     /* 遥测周期 ms(5~200)           
 #if   (MOTOR_NET_PROFILE == 0)
   #define MOTOR_WIFI_SSID       "XIOQ-3695"             /* 手机热点名                          */
   #define MOTOR_WIFI_PASSWORD   "123456890"             /* 热点密码(无密码填 NULL)             */
-  #define MOTOR_HOST_IP         "192.168.254.177"       /* 手机 ap0 地址(实测)                 */
+  #define MOTOR_HOST_IP         "192.168.244.69"       /* 手机 ap0 地址(实测)                 */
 #elif (MOTOR_NET_PROFILE == 1)
   #define MOTOR_WIFI_SSID       "ASC_Circuit_IoT"       /* 实验室 IoT 网                       */
   #define MOTOR_WIFI_PASSWORD   "1145141919810"
@@ -97,7 +97,10 @@ extern volatile float   spd_tel_period;     /* 遥测周期 ms(5~200)           
  *=================================================================================================================*/
 #define MOTOR_TX_PERIOD_MS      (20)        /* 遥测周期 ms: 20 -> 50Hz                      */
 #define MOTOR_RX_PERIOD_MS      (10)        /* 收命令周期 ms: 10 -> 100Hz                   */
-#define MOTOR_CH_COUNT          (38)        /* 全量档案的遥测通道数(见下面第四节)。
+#define MOTOR_CH_COUNT          (41)        /* 全量档案的遥测通道数(见下面第四节)。
+                                               ⭐ 2026-10-20 晚：38 → **41**，尾部追加诊断三件套
+                                                  tick_ms(38) / ins_frz(39) / ins_static(40)。
+                                                  用途只有一个：判"yaw 转一圈缺一块是 dt、刻度还是 ZUPT 冻结"。
                                                ⭐ 2026-10-19 **48 → 36 精简**：WiFi 是共享介质，
                                                   每多 1 通道 = 每帧多 4 B、50 Hz 下多 200 B/s。
                                                   砍掉的 12 个都是"中间量/一次性标定量"：
@@ -112,8 +115,8 @@ extern volatile float   spd_tel_period;     /* 遥测周期 ms(5~200)           
                                                ⚠ 标定精简档案是 18，见第五节 —— 运行时由参数 tel_sel 切。
                                                ⚠⚠ 缓冲上限仍是 48（`MOTOR_CH_COUNT_MAX`），以后加通道只要
                                                   ≤48 就不用动数组；但**上位机档案必须同步**，否则一条红条
-                                                  "帧量 36 ≠ 本档案 N、通道名整体错位"。
-                                                  当前 36ch 帧 = 21 + 36×4 = **165 B**（原 48ch = 213 B）。 */
+                                                  "帧量 41 ≠ 本档案 N、通道名整体错位"。
+                                                  当前 41ch 帧 = 21 + 41×4 = **185 B**（38ch 时 173 B）。 */
 #define MOTOR_CH_COUNT_MAX      (48)        /* 缓冲/协议上限（数组按它开，防越界） */
 #define MOTOR_RX_TIMEOUT_MS     (600)       /* 兜底值; 实际判定用可调的 spd_lost_ms          */
 
@@ -209,6 +212,21 @@ extern volatile float   spd_tel_period;     /* 遥测周期 ms(5~200)           
                                    ⚠ 与 CH_INS_YAW(27, 实测) 成对看：这两条就是
                                       "舵机外环"的输入与输出，台阶测试全靠它们量上升时间。 */
 #define CH_HT_SEG       (37)    /* 航向测试段号：0=没跑，1..n=第几段，254=跑完 */
+
+/* --- ★ 诊断三件套(38~40): 2026-10-20 晚加，专门用来判"yaw 转一圈缺一块"与"时基准不准"
+ *
+ *  为什么必须加在车端（上位机自己算不出来）：
+ *    · 时基只能车端自己数（`motor_link_now_ms()`，5 ms 中断累加）；
+ *    · ZUPT 冻结丢了多少度只有车端知道（`ins_imu_zupt_frz_deg()`）；
+ *    · "被判静止"用的是 **IMU 内部**的 s_is_static，**不是** odom 的 ODOM_ST_STILL
+ *      （后者 = "编码器 50 ms 没动"，抬着车原地转时它照样判静止 —— 两个别混）。
+ *  ⚠ 加完这三路：全量档案 = **41 通道**，帧 = 21 + 41×4 = **185 B**@50 Hz ≈ 9.3 kB/s，仍够用。
+ *  ⚠ 上位机 `Defaults.cs` / `Simulator.cs` / App `Proto.java` + `CsvLogger` 必须同步，
+ *    否则通道名整体错位（不报错、图看着还挺像 —— 见 kz.csv 那次）。 */
+#define CH_TICK_MS      (38)    /* 车端上电毫秒数(5ms 时基累加)。掐 60 s 秒表核时基就看它 */
+#define CH_INS_FRZ      (39)    /* ZUPT 冻结期间**被丢弃的转角** 度(累计, 只读不清)。
+                                   ⭐ 判据：转一圈它明显 > 0 且与缺口量级相当 ⇒ 就是冻结吃掉的 */
+#define CH_INS_STATIC   (40)    /* 1 = 本拍被判"静止"(航向正在被冻结)。与 CH_INS_FRZ 配对看 */
 
 /*===================================================================================================================
  *  五、★ 标定精简档案（18 通道）—— 只在"实车落地标定"时用，由参数 `tel_sel = 1` 切进来

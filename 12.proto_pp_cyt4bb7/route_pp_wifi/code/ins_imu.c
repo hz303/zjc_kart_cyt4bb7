@@ -78,6 +78,7 @@ static uint16   s_quick_cnt = 0;
 
 /* 输出 */
 static volatile float s_yaw_acc   = 0.0f;           /* ★ 累积航向（度） */
+static volatile uint16 s_yaw_rej  = 0u;             /* 被"单拍合理性闸门"丢掉的拍数（诊断）*/
 static volatile float s_yaw_raw   = 0.0f;           /* Mahony 的 -180~180 */
 static volatile float s_roll      = 0.0f;
 static volatile float s_pitch     = 0.0f;
@@ -166,8 +167,17 @@ static float ins_dt_seconds (void)
         uint32 cyc = now - s_dwt_last;                  /* uint32 差值天然处理回绕 */
         s_dwt_last = now;
 
-        /* 250 MHz 主频: 1 拍 5ms ≈ 1.25e6 周期 */
-        dt = (float)cyc / 250000000.0f;
+        /* ★★ 2026-10-20：**用运行期主频，不写死 250 MHz**。
+           原来这里硬编码 250e6：一旦 M0 那边把核心配成 280/350 MHz（或以后换板子），
+           dt 就会系统性偏小/偏大 ⇒ 四元数按错的时间积分 ⇒ **航向按比例少转/多转**。
+           这个错很像"陀螺刻度差 10%"，但根子在时钟：症状就是"转一圈 yaw 只有 320°"。
+           SystemCoreClock 由 SystemCoreClockUpdate() 启动时从寄存器算出。 */
+        {
+            float f_cpu = (float)SystemCoreClock;
+
+            if (f_cpu < 1.0e6f) { f_cpu = 250000000.0f; }   /* 没初始化就退回标称，别除 0 */
+            dt = (float)cyc / f_cpu;
+        }
 
         /* 合理区间 [T/2, 4T]；越界说明丢拍/抖动，钳回标称并置位 */
         if ((dt < (INS_T_S * 0.5f)) || (dt > (INS_T_S * 4.0f)))
@@ -645,12 +655,20 @@ static void ins_mahony_update (float dt)
     gz += kp * ez + s_ezInt;
 #endif
 
-    /* --- 四元数积分 + 归一化 --- */
+    /* --- 四元数积分 + 归一化 ---
+       ★★ 2026-10-20：改成**先用旧 q 一次算完 4 个微分，再一起加**。
+          原来是原地更新（q1 那一行已经用上刚改过的 q0），等于每个分量吃到的时间戳
+          都不一样；单拍误差 O(dt²) 很小，但它**随转速单调累积**——转一整圈就能看出
+          "航向少转了几度"，和陀螺刻度错的表现几乎一样，很难区分。 */
     halfT = 0.5f * dt;
-    q0 += (-q1 * gx - q2 * gy - q3 * gz) * halfT;
-    q1 += ( q0 * gx + q2 * gz - q3 * gy) * halfT;
-    q2 += ( q0 * gy - q1 * gz + q3 * gx) * halfT;
-    q3 += ( q0 * gz + q1 * gy - q2 * gx) * halfT;
+    {
+        float d0 = (-q1 * gx - q2 * gy - q3 * gz) * halfT;
+        float d1 = ( q0 * gx + q2 * gz - q3 * gy) * halfT;
+        float d2 = ( q0 * gy - q1 * gz + q3 * gx) * halfT;
+        float d3 = ( q0 * gz + q1 * gy - q2 * gx) * halfT;
+
+        q0 += d0; q1 += d1; q2 += d2; q3 += d3;
+    }
 
     mag_sum = q0*q0 + q1*q1 + q2*q2 + q3*q3;
     if ((mag_sum < 1e-6f) || (mag_sum > 1e6f) || (mag_sum != mag_sum))   /* NaN/Inf 保护 */
@@ -674,7 +692,26 @@ static void ins_mahony_update (float dt)
         float rel_z = pw * q3 - px * q2 + py * q1 - pz * q0;
         float dyaw  = 2.0f * atan2f(rel_z, rel_w) * RAD2DEG_F;
 
-        s_yaw_acc += dyaw;
+        /* ★ 单拍合理性闸门（2026-10-20）：按**本拍真实 dt** 折算角速度上限，
+           而不是写死 90°。写死的话，一旦主循环/中断被拖住（WiFi 收发、菜单刷屏），
+           那一拍的真转角可能就超过 90° —— **闸门自己会把真实转动丢掉**，
+           正好又制造出"转一圈角度缺一块"。这里用 3000 °/s 作上限：
+           本车满舵也就几百 °/s，单拍 5ms 约 15°，真毛刺挡得住，真转动漏不掉。 */
+        {
+            float lim = 3000.0f * dt;
+
+            if (lim <  10.0f) { lim =  10.0f; }
+            if (lim > 180.0f) { lim = 180.0f; }
+
+            if ((dyaw > lim) || (dyaw < -lim))
+            {
+                s_yaw_rej ++;
+            }
+            else
+            {
+                s_yaw_acc += dyaw;
+            }
+        }
     }
 
     s_q[0] = q0; s_q[1] = q1; s_q[2] = q2; s_q[3] = q3;
@@ -909,6 +946,7 @@ uint8  ins_imu_try_recover (void)
 }
 
 float  ins_imu_get_yaw (void)       { return INS_YAW_SIGN * s_yaw_acc; }
+uint16 ins_imu_yaw_rej (void)       { return s_yaw_rej; }
 float  ins_imu_get_roll (void)      { return s_roll; }
 float  ins_imu_get_pitch (void)     { return s_pitch; }
 float  ins_imu_get_gyro_z_dps (void){ return s_gz_dps; }

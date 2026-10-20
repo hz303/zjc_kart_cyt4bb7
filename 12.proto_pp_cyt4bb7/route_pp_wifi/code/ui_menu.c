@@ -638,19 +638,25 @@ static void dash_fmt(char *buf, uint8 size, void *ctx)
             break;
 
         default:
-            /* ★ CH3 ≤ 50% 时 CH1 在控航向 —— 这一行必须看得出来，
-               否则现场"方向盘不跟手"会以为是内环坏了。
-               c3 = CH3 百分比 / s = 当前步长 / o = 当前航向偏移（有符号）。 */
-            if (0u != RC_Hdg_Mode)
+            /* ★ 这一行是**现场核对通道**的唯一窗口（2026-10-20 加，当晚改过一次）：
+                 HDG / SRV   = CH3 二值开关选出来的模式（HDG = CH1 在控目标航向）
+                 三个数      = CH1 / CH2 / CH3 的**原始值**
+                 t896 / ?896 = CH3 当前判高低的阈值（t = 已标定 / ? = 还没见过开关两端）
+               末尾的 !      = CH1/CH2 有关键通道 raw 低于有效下限（掉线）
+               ⚠ CH1 显示 0 是"这个通道没信号"，**不是**"摇杆回中"——
+                 旧代码会把它归一成 -1 当成满舵，这就是"给油就莫名打角"的来路。
+               ⚠ CH3 的 0 **可能**是正常的低档（有的接收机就这么发）；看 mode 才知道判成了什么，
+                 所以阈值必须一起显示 —— 否则"拨了没反应"根本分不清是通道没接还是阈值不对。
+               ⚠ CH4（三档）已空置，不再占显示位。 */
+            if (0u != RC_Online)
             {
-                int off = (int)(RC_Hdg_Off + ((RC_Hdg_Off >= 0.0f) ? 0.5f : -0.5f));
-
-                snprintf(buf, size, "hdg c3=%u s%u.%u o%s%d",
-                         (unsigned)RC_Ch3_Pct,
-                         (unsigned)((int)(RC_Hdg_Step * 10.0f) / 10),
-                         (unsigned)((int)(RC_Hdg_Step * 10.0f) % 10),
-                         (off < 0) ? "-" : "+",
-                         (off < 0) ? -off : off);
+                snprintf(buf, size, "%s %u/%u/%u %s%u%s",
+                         (0u != RC_Hdg_Mode) ? "HDG" : "SRV",
+                         (unsigned)RC_Raw_Ch1, (unsigned)RC_Raw_Ch2,
+                         (unsigned)RC_Raw_Ch3,
+                         (0u != RC_Hdg_Cal) ? "t" : "?",
+                         (unsigned)RC_Hdg_Thr,
+                         (0u != RC_Stick_Bad) ? "!" : "");
             }
             else
             {

@@ -215,6 +215,7 @@ void    ins_imu_dev_id_get      (uint8 *id_0f, uint8 *id_00, uint8 *valid);
 
 /* 累积航向（度，可超 ±360）。这是惯导唯一需要的 IMU 输出。 */
 float   ins_imu_get_yaw         (void);
+uint16  ins_imu_yaw_rej         (void);   /* 被"单拍 >90 度"闸门丢掉的拍数：非 0 = 航向有毛刺/被重置 */
 float   ins_imu_get_roll        (void);
 float   ins_imu_get_pitch       (void);
 float   ins_imu_get_gyro_z_dps  (void);

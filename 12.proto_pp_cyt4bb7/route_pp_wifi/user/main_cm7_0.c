@@ -221,6 +221,16 @@ static void motor_fill_telemetry (void)
                                 : ((0u != steer.head_enable) ? steer_ctrl_get_target_yaw()
                                                              : ins_odom_get_yaw()));
     motor_link_ch_set(CH_HT_SEG,      head_test_seg());              /* 0关/1..n段/254完 */
+
+    /* --- 诊断三件套(38~40): 2026-10-20 晚加，用途见 motor_link.h 的 CH_TICK_MS 注解。
+       tick_ms   : 时基。掐 60 s 秒表对一对：涨约 60000 说明 5ms 时基准；涨 ~45000 说明中断被饿死
+                   或时基慢，那 yaw 少一块就跟 IMU 无关了。
+       ins_frz   : ZUPT 冻结期间被丢弃的转角(度, 累计, 只读不清)。
+                   转一圈它不为 0 且与缺口相当 = INS_ZUPT_FREEZE_YAW 把转角当零偏吃掉了。
+       ins_static: 冻结生效的那个条件本身(IMU 判静止)，不是 odom 的"编码器没动"。 */
+    motor_link_ch_set(CH_TICK_MS,    (float)motor_link_now_ms());
+    motor_link_ch_set(CH_INS_FRZ,    ins_imu_zupt_frz_deg());
+    motor_link_ch_set(CH_INS_STATIC, (float)((0u != (ins_imu_flags() & INS_ST_STATIC)) ? 1u : 0u));
 }
 
 /*===================================================================================================================
@@ -313,6 +323,12 @@ static void motor_print_status (void)
            (unsigned long)enc_l.flip,
            (unsigned long)enc_l.glitch);
 
+    /* 航向自检（2026-10-20）：yaw 是**累积值**（不折叠），转一圈就该 +360。
+       rej = 被"单拍转角超限"闸门丢掉的拍数。**非 0 就意味着 yaw 被谁打断过**，
+       表现正是"转一圈角度残缺"（少一块），那时先查 SPI_2/供电，别去调外环。 */
+    printf("[##] IMU yaw=%ld deg  rej=%u\r\n",
+           (long)ins_imu_get_yaw(), (unsigned)ins_imu_yaw_rej());
+
     /* 转向一行: 目标/实测转角、输出 duty、绝对编码器原始角与自检结果。
        排障第一现场 —— 不动方向盘时 raw 应该稳定、delta 应该接近 0。 */
     {
@@ -376,6 +392,23 @@ static void motor_print_status (void)
                (unsigned)spd_safety_local(),
                (unsigned)motor_link_ch_count(),
                (unsigned)motor_link_tx_period_ms());
+
+        /* CH3 / 航向模式一行（2026-10-20 加）：判断"CH3 到底读到没有"只看这一行。
+             c3  = CH3 原始值（0 也可能是**正常的低档**，别急着当掉线）
+             thr = 当前判高低的自适应阈值；cal=1 表示已经见过开关两端
+             mode= HDG(CH1 控航向) / SRV(CH1 控舵机角)
+             off = 当前航向偏移(deg，CH1 给)；ty = 目标航向；yw = 实测航向
+             判读：拨 CH3 时 c3 要跳、mode 要跟着翻；
+                   c3 一动不动     = 这个通道压根没接 / 没映射（去查线或通道分配）
+                   拨了但 mode 不翻 = 量程特殊，把 c3 两头读到的值发我，改标定判据 */
+        printf("        RC3 c3=%u thr=%u cal=%u mode=%s off=%d ty=%d yw=%d\r\n",
+               (unsigned)RC_Raw_Ch3,
+               (unsigned)RC_Hdg_Thr,
+               (unsigned)RC_Hdg_Cal,
+               (0u != RC_Hdg_Mode) ? "HDG" : "SRV",
+               (int)RC_Hdg_Off,
+               (int)RC_Cmd_Yaw,
+               (int)steer_yaw_deg);
     }
 
     /* 惯导一行: 航向 / 陀螺Z / 位姿 / 里程 / 状态位 / 零偏 / 静止统计。

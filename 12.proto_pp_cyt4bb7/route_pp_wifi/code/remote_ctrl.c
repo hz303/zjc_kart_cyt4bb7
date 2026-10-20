@@ -27,7 +27,10 @@ volatile uint16  RC_Raw_Ch6     = 0;
 volatile float   RC_Steer_Deg   = 0.0f;
 volatile float   RC_Steer_Norm  = 0.0f;
 volatile uint8   RC_Ch3_Pct     = 100u;
+volatile uint8   RC_Stick_Bad   = 0u;       /* bit0 CH1 / bit1 CH2 / bit2 CH3 的 raw 低于有效下限 */
 volatile uint8   RC_Hdg_Mode    = 0u;
+volatile uint16  RC_Hdg_Thr     = RC_SW_VAL_MID;   /* CH3 阈值：自适应，见 rc_ch3_track() */
+volatile uint8   RC_Hdg_Cal     = 0u;              /* 1 = 已标定（见过开关两端） */
 volatile float   RC_Hdg_Step    = 1.0f;
 volatile float   RC_Hdg_Off     = 0.0f;
 volatile float   RC_Cmd_Yaw     = 0.0f;
@@ -87,22 +90,98 @@ static float rc_fabs (float v)
 }
 
 /*----------------------------------------------------------
- * CH4 油门行程旋钮 -> 速度缩放
- *   旋钮低 -> RC_SCALE_MIN，中 -> 两者中点，高 -> RC_SCALE_MAX。
- *   用 rc_norm 拿到 -1~+1 再线性映射到 [MIN, MAX]，两端对称。
- *   ⚠ CH3（方向行程）**用户明确说先不做**，所以这里不读它；
- *     但遥测/打印里预留了位置，将来要做时在这里加一个 rc_steer_travel() 即可。
+ * CH3 二值开关：自适应阈值 + 滞环  ->  RC_Hdg_Mode
+ *
+ *   ★★ 2026-10-20 第二次修（现场反馈：CH3 拨到"低"仍然只有舵机角模式）
+ *
+ *   旧写法是 `(raw > 992) ? 舵机 : 航向`，外加"raw<120 判成掉线 ⇒ 强制舵机"。
+ *   这三个假设里任何一个不成立，症状都**一模一样**：模式永远出不来。
+ *     ① 低档 = 0     -> 先被 RC_CH_VALID_MIN 判成"没信号"，强制舵机（就是现在的现象）
+ *     ② 低档 = 992   -> 阈值正好压在低档上，`>992` 不成立 ⇒ 高档反而判成"低"？两边都错
+ *     ③ 量程不是 192~1792（有的接收机 1000~2000）-> 992 这个数根本不在量程里
+ *
+ *   ⇒ 不再相信写死的端点：自己记 min/max，
+ *        · 见过 >1200（说明开关真能到高位）且跨度 ≥400 ⇒ 标定，阈值 = (min+max)/2；
+ *        · 通道真没接（恒 0 / 恒 992，跨度不够）      ⇒ **不标定**，保持舵机角模式（最保守）。
+ *      阈值两侧各留 RC_HDG_HYST 的滞环：开关在临界点抖动时模式不会来回翻
+ *      （翻一次就会把"松手基准航向"重取一次，车会莫名其妙偏一下）。
+ *
+ *   ⚠ 极性：**低 = 航向 / 高 = 舵机角**（用户定的）。所以 mode = !s_c3_hi。
  *----------------------------------------------------------*/
-static float rc_thr_travel_scale (void)
+static uint16 s_c3_min = 0x0FFFu;
+static uint16 s_c3_max = 0u;
+static uint8  s_c3_cal = 0u;
+static uint8  s_c3_hi  = 0u;            /* 0 = 低档（航向） / 1 = 高档（舵机角） */
+
+static void rc_ch3_track (void)
 {
-    float n = rc_norm(RC_Raw_Ch4, RC_SW_VAL_MID, RC_SW_VAL_LOW, RC_SW_VAL_HIGH);
-    float s = RC_SCALE_MIN + ((n + 1.0f) * 0.5f) * (RC_SCALE_MAX - RC_SCALE_MIN);
+    uint16 thr;
+    uint8  mode;
 
-    if (s < RC_SCALE_MIN) { s = RC_SCALE_MIN; }
-    if (s > RC_SCALE_MAX) { s = RC_SCALE_MAX; }
+    if (RC_Raw_Ch3 < s_c3_min) { s_c3_min = RC_Raw_Ch3; }
+    if (RC_Raw_Ch3 > s_c3_max) { s_c3_max = RC_Raw_Ch3; }
 
-    return s;
+    if ((0u == s_c3_cal) &&
+        ((uint32)(s_c3_max - s_c3_min) >= 400u) &&
+        (s_c3_max >= 1200u))
+    {
+        s_c3_cal = 1u;
+        printf("[RC] CH3 calibrated: min=%u max=%u\r\n",
+               (unsigned)s_c3_min, (unsigned)s_c3_max);
+    }
+
+    thr = (0u != s_c3_cal) ? (uint16)(((uint32)s_c3_min + (uint32)s_c3_max) / 2u)
+                           : (uint16)RC_SW_VAL_MID;
+
+    RC_Hdg_Thr = thr;
+    RC_Hdg_Cal = s_c3_cal;
+
+    /* 滞环：低->高 要 > thr+60；高->低 要 < thr-60 */
+    if (0u == s_c3_hi)
+    {
+        if (RC_Raw_Ch3 > (uint16)(thr + RC_HDG_HYST)) { s_c3_hi = 1u; }
+    }
+    else
+    {
+        if (((uint32)RC_Raw_Ch3 + RC_HDG_HYST) < (uint32)thr) { s_c3_hi = 0u; }
+    }
+
+    /* 没标定 + 通道没信号 = 不知道开关在哪 -> 保持舵机角模式（原行为最安全） */
+    if ((0u == s_c3_cal) && (0u != (RC_Stick_Bad & 0x04u)))
+    {
+        mode = 0u;
+    }
+    else
+    {
+        mode = (0u != s_c3_hi) ? 0u : 1u;
+    }
+
+    if (mode != RC_Hdg_Mode)
+    {
+        RC_Hdg_Mode = mode;
+        printf("[RC] CH3 -> %s (raw=%u thr=%u span=%u)\r\n",
+               (0u != mode) ? "HEADING" : "SERVO",
+               (unsigned)RC_Raw_Ch3, (unsigned)thr,
+               (unsigned)(s_c3_max - s_c3_min));
+    }
+
+    /* ★ 标定过就不要再把 CH3 的 0 报成"掉线"：有的接收机低档就是发 0，
+       再置 bit2 只会让屏幕一直挂着 `!`，把"真的掉线"这个信号淹掉。 */
+    if (0u != s_c3_cal)
+    {
+        RC_Stick_Bad = (uint8)(RC_Stick_Bad & (uint8)~0x04u);
+    }
 }
+
+/*----------------------------------------------------------
+ * 油门行程缩放：**恒 1.0，不从通道读**
+ *
+ *   ⚠⚠ 2026-10-20 用户定稿：油门行程的缩放在**发射机**上（有个旋钮专门调 CH2 的行程），
+ *      接收机收到的 CH2 已经是缩过的 ⇒ 代码里再乘一次就是**平方**（0.5 的行程变成 0.25）。
+ *      那个三档开关（CH4）**空置**，不承担任何功能。
+ *   想调快慢：拧发射机那个旋钮，或改参数表 rc_thr_max(28)。
+ *   想临时限速：用路表/回放里的 pb_vmax 或菜单 7.Speed。
+ *----------------------------------------------------------*/
 
 /*----------------------------------------------------------
  * 按步长量化（0.2 / 0.5 / 1.0 deg）
@@ -277,10 +356,22 @@ void remote_ctrl_update (void)
     /* 方向盘：**先过中位死区**（±RC_STEER_DEADBAND），再归一化到 -1~+1 乘【实际生效限位】。
        ⚠ 用 steer_ctrl_eff_limit() 而不是 steer.limit_deg：那是**全系统唯一出口**，
          已经保证"参数怎么改都越不过 ±27"（见 steer_abs.h / steer_ctrl.h）。 */
+    /* ★★ 2026-10-20：**"没有信号" ≠ "打满"**。
+       接收机取不到某通道时 `channel[]` 是 0，而 0 在量程 192~1792 之外：
+       归一化会算出 -1.24、夹到 -1 ⇒ 满舵（油门同理 ⇒ 满倒车，更危险）。
+       现场症状就是题述的"CH1 为 0 时一给油，方向盘莫名其妙打一个角"——
+       其实是"方向盘被判成左满舵"，只是 OFF/STANDBY 不写转向，一合闸才看得见。
+       ⇒ raw 低于有效下限时按"摇杆回中"处理，并记进 RC_Stick_Bad（屏幕那一行看得见）。 */
+    RC_Stick_Bad = 0u;
+    if (RC_Raw_Ch1 < RC_CH_VALID_MIN) { RC_Stick_Bad |= 0x01u; }
+    if (RC_Raw_Ch2 < RC_CH_VALID_MIN) { RC_Stick_Bad |= 0x02u; }
+    if (RC_Raw_Ch3 < RC_CH_VALID_MIN) { RC_Stick_Bad |= 0x04u; }
+
     {
         int d = (int)RC_Raw_Ch1 - RC_STEER_MID;
 
-        if ((d <= RC_STEER_DEADBAND) && (d >= -RC_STEER_DEADBAND))
+        if ((0u != (RC_Stick_Bad & 0x01u)) ||
+            ((d <= RC_STEER_DEADBAND) && (d >= -RC_STEER_DEADBAND)))
         {
             /* 死区内 = 方向盘回中：不跟着手上/电位器的零点漂移走。
                （没有这一段时，静止时方向盘会被 ±1~2 个计数的抖动顶到零点几度） */
@@ -297,50 +388,25 @@ void remote_ctrl_update (void)
 
     /* 油门：同样 ±RC_THR_DEADBAND 死区，把静止抖动压成 0（队友实测中位在 988/990/992 之间跳） */
     thr = (int)RC_Raw_Ch2 - RC_THR_MID;
-    if ((thr <= RC_THR_DEADBAND) && (thr >= -RC_THR_DEADBAND))
+    if ((0u != (RC_Stick_Bad & 0x02u)) ||
+        ((thr <= RC_THR_DEADBAND) && (thr >= -RC_THR_DEADBAND)))
     {
-        RC_Throttle = 0.0f;
+        RC_Throttle = 0.0f;         /* 通道没信号时按"油门回中"，不许变成满倒车 */
     }
     else
     {
         RC_Throttle = rc_norm(RC_Raw_Ch2, RC_THR_MID, RC_THR_MIN, RC_THR_MAX);
     }
 
-    /* CH4 旋钮 -> 速度缩放 */
-    RC_Scale = rc_thr_travel_scale();
+    RC_Scale = RC_SCALE_MAX;    /* 恒 1.0，见上面那段：行程在发射机侧缩 */
 
-    /* CH3 旋钮 -> 航向微调档位 / 模式（见 remote_ctrl.h 三·五）
-       ⚠ 没接 CH3（原始值≈0）时当成"舵机模式"：否则默认 0% 会把 CH1 偷偷变成航向控制，
-         现场完全看不出"方向盘为什么不跟手"。 */
-    {
-        float pct;
-
-        if (RC_Raw_Ch3 < RC_CH3_VALID_MIN)
-        {
-            pct = 100.0f;                                   /* 没信号 -> 舵机模式 */
-        }
-        else
-        {
-            pct = (rc_norm(RC_Raw_Ch3, RC_SW_VAL_MID, RC_SW_VAL_LOW, RC_SW_VAL_HIGH) + 1.0f) * 50.0f;
-        }
-
-        if (pct <   0.0f) { pct =   0.0f; }
-        if (pct > 100.0f) { pct = 100.0f; }
-
-        RC_Ch3_Pct = (uint8)pct;
-
-        if (pct <= RC_HDG_CH3_PCT_MAX)
-        {
-            RC_Hdg_Mode = 1u;
-            RC_Hdg_Step = (pct < 15.0f) ? RC_HDG_STEP_FINE
-                        : ((pct < 25.0f) ? RC_HDG_STEP_MED : RC_HDG_STEP_COARSE);
-        }
-        else
-        {
-            RC_Hdg_Mode = 0u;
-            RC_Hdg_Step = RC_HDG_STEP_COARSE;
-        }
-    }
+    /* CH3 **二值**开关 -> 模式：低 = CH1 给目标航向 / 高 = CH1 给舵机角。
+       ★ 阈值**不写死**，走 rc_ch3_track() 的自适应 + 滞环
+         （那段注释列了三种现场接法和"为什么旧写法一定出不来模式"）。
+       ⚠ 顺序：必须放在 RC_Stick_Bad 算完之后 —— rc_ch3_track() 要用 bit2 判"通道没信号"。 */
+    rc_ch3_track();
+    RC_Ch3_Pct  = (0u != RC_Hdg_Mode) ? 0u : 100u;
+    RC_Hdg_Step = RC_HDG_STEP;
 }
 
 /*----------------------------------------------------------
