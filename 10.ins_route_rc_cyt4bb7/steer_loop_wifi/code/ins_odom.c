@@ -1,7 +1,4 @@
-/*********************************************************************************************************************
- * C 车惯导 + 路表 - 航位推算实现
- * 坐标约定、Polaris 缺陷修正、比例尺说明 见 ins_odom.h
- ********************************************************************************************************************/
+/* C 车惯导 + 路表 - 航位推算实现 */
 
 #include "zf_common_headfile.h"
 #include <math.h>
@@ -11,42 +8,32 @@
 
 #define DEG2RAD_F   (0.017453292519943295f)
 
-/*===================================================================================================================
- *  ★★ 临界区：**绝不要用逐飞的 `interrupt_global_disable()` / `interrupt_global_enable(pm)` 配对**
- *
- *  原因（见 libraries/zf_common/zf_common_interrupt.c）—— 那一对不是"保存/恢复 PRIMASK"，
- *  而是一个自增自减的计数器，且 `enable` 只在参数为 0 时才真的开中断：
- *
- *      void interrupt_global_enable (uint32 primask)
- *      {
- *          if(primask == 0) { __enable_irq(); }    // ★ 只有传 0 才开中断
- *          interrupt_global_flag ++;
- *      }
- *      uint32 interrupt_global_disable (void)
- *      {
- *          __disable_irq();
- *          if(interrupt_global_flag > 0) interrupt_global_flag --;
- *          return interrupt_global_flag;           // ★ 返回计数器，不是 PRIMASK
- *      }
- *
- *  ⇒ `clock_init()` 里调过一次 `interrupt_global_enable(0)`，`main()` 里又调一次，
- *    计数器已经 ≥ 2。此后写 `pm = disable(); ...; enable(pm);`，`pm` 拿到的是 1（非 0）
- *    ⇒ **`__enable_irq()` 不会执行 ⇒ 中断被永久关死，且零报错**。
- *    症状：主循环照跑，但 5ms 中断再不进入 ⇒ 速度环/编码器/IMU 全停、`motor_tick_ms` 不涨、
- *    WiFi 一帧不发（`motor_link_task()` 连 if 体都不进）。
- *
- *  ⇒ 正确做法就是下面两行：直接存取 PRIMASK（CMSIS 标准做法，可任意嵌套）。
- *=================================================================================================================*/
+/* 原因（见 libraries/zf_common/zf_common_interrupt.c）—— 那一对不是"保存/恢复 PRIMASK"，
+ * 而是一个自增自减的计数器，且 `enable` 只在参数为 0 时才真的开中断：
+ * void interrupt_global_enable (uint32 primask)
+ * {
+ * interrupt_global_flag ++;
+ * }
+ * uint32 interrupt_global_disable (void)
+ * {
+ * __disable_irq();
+ * if(interrupt_global_flag > 0) interrupt_global_flag --;
+ * }
+ * ⇒ `clock_init()` 里调过一次 `interrupt_global_enable(0)`，`main()` 里又调一次，
+ * 计数器已经 ≥ 2。此后写 `pm = disable(); ...; enable(pm);`，`pm` 拿到的是 1（非 0）
+ * ⇒ **`__enable_irq()` 不会执行 ⇒ 中断被永久关死，且零报错**。
+ * 症状：主循环照跑，但 5ms 中断再不进入 ⇒ 速度环/编码器/IMU 全停、`motor_tick_ms` 不涨、
+ * WiFi 一帧不发（`motor_link_task()` 连 if 体都不进）。
+ * ⇒ 正确做法就是下面两行：直接存取 PRIMASK（CMSIS 标准做法，可任意嵌套）。
+ */
 static uint32 ins_crit_enter (void) { uint32 pm = __get_PRIMASK(); __disable_irq(); return pm; }
 static void   ins_crit_exit  (uint32 pm) { __set_PRIMASK(pm); }
 
-volatile float  ins_m_per_rev   = INS_MPM_DEFAULT;  /* ★ 工程 10：2026-10-15 实测定稿 0.8193（2.815 m / 6383.5 cnt，cpr 1858），见 ins_odom.h */
+volatile float  ins_m_per_rev   = INS_MPM_DEFAULT;
 volatile float  ins_odom_enable = 1.0f;
 volatile float  ins_slip_pct    = 30.0f;
 
-/* ★ 工程 10 新增：位姿归零命令（参数表 ID 37）。0->1 边沿触发一次，
-   由 main 的慢速决策层消费（ins_odom_reset() + ins_imu_zero_yaw()）—— 与工程 8 同一套写法。
-   ⚠ 归零必须"位姿 + 航向"一起归：只归一个，后面所有相对量（路表、回放）就整体错位。 */
+/* 由 main 的慢速决策层消费（ins_odom_reset() + ins_imu_zero_yaw()）—— 与工程 8 同一套写法。 */
 volatile float  ins_zero_cmd    = 0.0f;
 
 static volatile float s_x        = 0.0f;
@@ -82,8 +69,7 @@ void ins_odom_reset (void)
     s_flags &= (uint8)~ODOM_ST_SLIP;
     s_flags |=  ODOM_ST_ACTIVE;
 
-    /* 位置清零时同步把编码器累计计数也清了，避免下次更新时把
-       "清零前就攒下的计数" 一次性吃进来（Polaris 在 set_active 里专门处理过这个）。 */
+    /* 位置清零时同步把编码器累计计数也清了，避免下次更新时把 */
     spd_enc_reset_pos(&enc_l);
     spd_enc_reset_pos(&enc_r);
 }
@@ -102,10 +88,7 @@ void ins_odom_set_origin (float x, float y, float yaw_deg)
     spd_enc_reset_pos(&enc_r);
 }
 
-/*-------------------------------------------------------------------------------------------------------------------
- *  5ms 每拍
- *  必须在 spd_ctrl_tick() 之后调用 —— 那里面的 spd_enc_update() 才是本拍的 Δcnt。
- *-----------------------------------------------------------------------------------------------------------------*/
+/* 5ms 每拍 必须在 spd_ctrl_tick() 之后调用 —— 那里面的 spd_enc_update() 才是本拍的 Δcnt。 */
 void ins_odom_update (void)
 {
     float dl_m, dr_m, ds;
@@ -158,7 +141,6 @@ void ins_odom_update (void)
         }
     }
 
-    /* --- 积分（带符号的 ds —— 这是相对 Polaris 的关键修正） --- */
     if (ins_odom_enable > 0.5f)
     {
         float rad = yaw_deg * DEG2RAD_F;
@@ -174,9 +156,6 @@ void ins_odom_update (void)
     s_flags = (uint8)(flags | ODOM_ST_ACTIVE);
 }
 
-/*-------------------------------------------------------------------------------------------------------------------
- *  查询
- *-----------------------------------------------------------------------------------------------------------------*/
 float ins_odom_get_x    (void) { return s_x; }
 float ins_odom_get_y    (void) { return s_y; }
 float ins_odom_get_yaw  (void) { return s_yaw; }
@@ -199,8 +178,7 @@ void ins_odom_snapshot (ins_odom_snap_t *out)
 
     if (NULL == out) { return; }
 
-    /* ★ 见 ins_odom.h 缺陷 2：x/y/yaw/dist 必须一次性复制，
-       否则会被 5ms 中断插到半路，拿到"旧 x + 新 yaw"的撕裂值。 */
+    /* 否则会被 5ms 中断插到半路，拿到"旧 x + 新 yaw"的撕裂值。 */
     primask = ins_crit_enter();
     out->x        = s_x;
     out->y        = s_y;

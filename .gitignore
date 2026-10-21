@@ -28,16 +28,24 @@ publish/
 *.user
 
 # ---------- 工具脚本产生的临时输出 ----------
-_*.txt             # 带下划线开头的是临时抓包/日志
+# 带下划线开头的是临时抓包/日志
+_*.txt
 selftest*.txt
 form.png
 form.layout.txt
-*.layout.txt       # LayoutAudit 的体检报告
+# LayoutAudit 的体检报告
+*.layout.txt
 *.csv
-shot_*.png         # --shot-form 出图
+# --shot-form 出图
+shot_*.png
 crop_*.png
 form*.png
+host_*.png
 主屏-导出CSV按钮.png
+
+# 打包产物
+*.rar
+*.zip
 
 # ---------- Python ----------
 __pycache__/

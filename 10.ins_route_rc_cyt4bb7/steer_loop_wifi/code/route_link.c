@@ -1,29 +1,21 @@
-/*********************************************************************************************************************
- * 串口"灌表"链路实现（协议见 route_link.h）
- ********************************************************************************************************************/
+/* 串口"灌表"链路实现（协议见 route_link.h） */
 
 #include "zf_common_headfile.h"
 #include "route_link.h"
 #include "motor_link.h"         /* motor_link_now_ms() —— 主循环毫秒时基 */
 #include "ins_route.h"
 
-/*===================================================================================================================
- *  ★ 日志静音门闩
- *      定义在 `libraries/zf_common/zf_common_debug.c`（**两个核都编那个文件**，而本模块只在 CM7_0），
- *      它的 `__write()` 会检查这个变量：传输期间置 1 ⇒ printf 的字节全部丢弃。
- *      为什么必须这么做：日志和协议帧走**同一根 UART**，字节插进去 PC 就解不出那一帧。
- *      ⚠ 只丢弃 printf 的字节；本模块自己的帧用 uart_write_buffer 直发，不受影响。
- *=================================================================================================================*/
+/* 定义在 `libraries/zf_common/zf_common_debug.c`（**两个核都编那个文件**，而本模块只在 CM7_0），
+ * 它的 `__write()` 会检查这个变量：传输期间置 1 ⇒ printf 的字节全部丢弃。
+ */
 extern volatile uint8 debug_uart_mute;
 
-/*===================================================================================================================
- *  接收：环形缓冲（ISR 写 head，主循环读 tail —— 单生产者单消费者，不用锁）
- *=================================================================================================================*/
+/* 接收：环形缓冲（ISR 写 head，主循环读 tail —— 单生产者单消费者，不用锁） */
 static volatile uint16 s_rx_head = 0u;
 static volatile uint16 s_rx_tail = 0u;
 static volatile uint8  s_rx_ring[RL_RX_RING_SZ];
 
-static uint8   s_frm[RL_PAYLOAD_MAX + 8u];      /* 正在拼的一帧（同步2+type1+len2+payload+crc2）*/
+static uint8   s_frm[RL_PAYLOAD_MAX + 8u];      /* 正在拼的一帧（同步2+type1+len2+payload+crc2） */
 static uint16  s_frm_len = 0u;
 
 static uint32  s_frames   = 0u;
@@ -31,30 +23,25 @@ static uint32  s_bad      = 0u;
 static uint32  s_last_ms  = 0u;
 
 /* 传输状态 */
-static uint8   s_in_xfer   = 0u;                /* 1 = 正在收 LOAD_DATA             */
-static uint8   s_busy_write= 0u;                /* 1 = COMMIT 后正在分步写 Flash     */
+static uint8   s_in_xfer   = 0u;                /* 1 = 正在收 LOAD_DATA */
+static uint8   s_busy_write= 0u;                /* 1 = COMMIT 后正在分步写 Flash */
 static uint8   s_slot      = 0u;
 static uint32  s_total     = 0u;
 static uint32  s_fill      = 0u;
 static uint32  s_deadline  = 0u;
 
-/* ★ 镜像暂存：一张表最多 INS_RT_SLOT_MAX_BYTES（**36 + 2048×16 = 32804 B**，v2）
- *  ⚠ 这是 CM7_0 RAM 里最大的一块静态缓冲（32 KB）。以后记录再加宽，这里跟着涨，
- *    记得复核 CM7_0 的 .bss 余量（384 KB）。 */
+/* 记得复核 CM7_0 的 .bss 余量（384 KB）。 */
 static uint8   s_buf[INS_RT_SLOT_MAX_BYTES];
 
-/*===================================================================================================================
- *  小工具
- *=================================================================================================================*/
 static uint16 rl_crc16 (uint16 crc, const uint8 *p, uint32 n)
 {
     uint32 i;
     uint8  j;
 
-    /* ⚠ CRC16-MODBUS：初值 0xFFFF / 反射多项式 0xA001。
-       本工程里现在有三份实现（ins_route.c 的 rt_crc16、motor_link.c 的 motor_crc16、这里），
-       以及 PC 侧的 Python。**它们必须算出同一个值** —— 否则现象是"帧看着发出去了，
-       对面永远不回 ACK"，而三方各自都自认为正确。改一处要四处一起改。 */
+    /* 本工程里现在有三份实现（ins_route.c 的 rt_crc16、motor_link.c 的 motor_crc16、这里），
+     * 以及 PC 侧的 Python。**它们必须算出同一个值** —— 否则现象是"帧看着发出去了，
+     * 对面永远不回 ACK"，而三方各自都自认为正确。改一处要四处一起改。
+     */
     for (i = 0; i < n; i ++)
     {
         crc ^= (uint16)p[i];
@@ -85,9 +72,9 @@ static void rl_quiet (uint8 on)
     debug_uart_mute = (0u != on) ? 1u : 0u;
 }
 
-/* 组一帧发出去。⚠ 阻塞（uart_write_buffer 是忙等），但帧都很短：
-   最大的是 DIR_DATA（142 B payload ⇒ 156 B 帧 ⇒ 115200 下约 13.5 ms）。
-   13 ms 的主循环停顿可以接受 —— 5 ms 中断（控制 + 惯导）照跑。 */
+/* 最大的是 DIR_DATA（142 B payload ⇒ 156 B 帧 ⇒ 115200 下约 13.5 ms）。
+ * 13 ms 的主循环停顿可以接受 —— 5 ms 中断（控制 + 惯导）照跑。
+ */
 static void rl_send (uint8 type, const uint8 *pl, uint16 len)
 {
     static uint8 tx[RL_PAYLOAD_MAX + 8u];
@@ -121,9 +108,6 @@ static void rl_ack (uint8 cmd, uint8 result, uint16 detail)
     rl_send(RL_T_ACK, pl, 4u);
 }
 
-/*===================================================================================================================
- *  各命令
- *=================================================================================================================*/
 static void rl_reply_pong (void)
 {
     uint8 pl[12];
@@ -133,8 +117,7 @@ static void rl_reply_pong (void)
     pl[2] = (uint8)INS_RT_SLOT_PAGES;
     pl[3] = (uint8)INS_RT_REC_SIZE;
     rl_wr_u32(pl + 4u, (uint32)INS_RT_SLOT_MAX_BYTES);
-    /* ★ v2 新增：能力位（见 route_link.h 的 RL_CAP_*）。老上位机只读前 8 B，
-       多出来的 4 B 会被它忽略 ⇒ 向后兼容。新上位机靠它认出"车端固件旧"。 */
+    /* 多出来的 4 B 会被它忽略 ⇒ 向后兼容。新上位机靠它认出"车端固件旧"。 */
     rl_wr_u32(pl + 8u, (uint32)RL_CAP_ALL);
 
     rl_send(RL_T_PONG, pl, 12u);
@@ -156,7 +139,7 @@ static void rl_reply_dir (void)
 
         pl[n ++] = inf.valid;
         pl[n ++] = inf.slot;
-        pl[n ++] = 0u;                      /* rsv */
+        pl[n ++] = 0u;
         pl[n ++] = 0u;
         rl_wr_u32(pl + n, inf.count ); n = (uint8)(n + 4u);
         rl_wr_u32(pl + n, inf.lap_mm); n = (uint8)(n + 4u);
@@ -178,7 +161,6 @@ static void rl_load_begin (const uint8 *pl, uint16 len)
     s_slot = pl[0];
     total  = rl_rd_u32(pl + 1u);
 
-    /* ★★ 纪律：**只允许写槽 1..N-1**。槽 0 是"手推录制"的家 ⇒ 灌表在协议层就碰不到它。 */
     if ((0u == s_slot) || (s_slot >= (uint8)INS_RT_SLOT_COUNT))
     {
         rl_ack(RL_T_LOAD_BEGIN, RL_ERR_SLOT, s_slot);
@@ -194,7 +176,7 @@ static void rl_load_begin (const uint8 *pl, uint16 len)
     s_fill     = 0u;
     s_in_xfer  = 1u;
     s_deadline = motor_link_now_ms() + RL_LOAD_TIMEOUT_MS;
-    rl_quiet(1u);                       /* ★ 从现在起到 COMMIT/ABORT 结束，日志静音 */
+    rl_quiet(1u);
 
     rl_ack(RL_T_LOAD_BEGIN, RL_OK, 0u);
 }
@@ -228,9 +210,7 @@ static void rl_load_commit (void)
     if (0u == s_in_xfer)     { rl_ack(RL_T_LOAD_COMMIT, RL_ERR_NOSTART, 0u); return; }
     if (s_fill < s_total)    { rl_ack(RL_T_LOAD_COMMIT, RL_ERR_OFFSET, (uint16)(s_fill & 0xFFFFu)); return; }
 
-    /* 先校验镜像 + 展开进 RAM，再"武装"分步写盘。
-       ⚠ 真正的 Flash 写由主循环 `ins_route_flash_poll()` 一页一页推进（否则几十毫秒阻塞会
-         顶穿保护层的心跳门）。所以这里只 ACK "收到并已武装"，写完再发 LOAD_DONE。 */
+    /* 先校验镜像 + 展开进 RAM，再"武装"分步写盘。 顶穿保护层的心跳门）。所以这里只 ACK "收到并已武装"，写完再发 LOAD_DONE。 */
     rc = ins_route_slot_load_image(s_slot, s_buf, s_fill);
 
     if (0u != rc)
@@ -255,8 +235,7 @@ static void rl_abort (uint8 result)
     rl_ack(RL_T_LOAD_ABORT, result, 0u);
 }
 
-/*---- 上传（车 → PC）：按镜像偏移拉一块。**拉模式**，车端不存状态 ——
-      一台机器的"流控"全在 PC 侧，车端只负责"要哪块给哪块"，出问题也只丢一块。----*/
+/* ---- 上传（车 → PC）：按镜像偏移拉一块。**拉模式**，车端不存状态 —— 一台机器的"流控"全在 PC 侧，车端只负责"要哪块给哪块"，出问题也只丢一块。---- */
 static void rl_slot_read (const uint8 *pl, uint16 len)
 {
     static uint8 out[7u + RL_CHUNK_MAX];
@@ -332,12 +311,11 @@ static void rl_dispatch (uint8 type, const uint8 *pl, uint16 len)
     }
 }
 
-/*===================================================================================================================
- *  拆帧（逐字节喂）
- *     帧：A5 5A | type | len(2,LE) | payload | crc16(2,LE)，总长 = 7 + len
- *     CRC 覆盖 type|len|payload。同步头/长度任一不对就**只丢 1 个字节**再重找
- *     （丢整帧会把后面真正的一帧一起丢掉 —— 这条是 motor_link.c 那边踩过的）。
- *=================================================================================================================*/
+/* 拆帧（逐字节喂）
+ * 帧：A5 5A | type | len(2,LE) | payload | crc16(2,LE)，总长 = 7 + len
+ * CRC 覆盖 type|len|payload。同步头/长度任一不对就**只丢 1 个字节**再重找
+ * （丢整帧会把后面真正的一帧一起丢掉 —— 这条是 motor_link.c 那边踩过的）。
+ */
 static void rl_drop1 (void)
 {
     if (s_frm_len > 1u) { memmove(s_frm, s_frm + 1u, (uint32)(s_frm_len - 1u)); }
@@ -351,7 +329,7 @@ static void rl_feed (uint8 b)
     uint16 crc;
     uint16 got;
 
-    if (s_frm_len >= (uint16)sizeof(s_frm)) { s_frm_len = 0u; }     /* 防御 */
+    if (s_frm_len >= (uint16)sizeof(s_frm)) { s_frm_len = 0u; }
     s_frm[s_frm_len ++] = b;
 
     /* --- 同步头：滑窗 --- */
@@ -390,9 +368,7 @@ static void rl_feed (uint8 b)
     }
 }
 
-/*===================================================================================================================
- *  对外接口
- *=================================================================================================================*/
+/* 对外接口 */
 void route_link_init (void)
 {
     s_rx_head = s_rx_tail = 0u;
@@ -415,10 +391,10 @@ void route_link_rx_byte (uint8 b)
     s_rx_head = nxt;
 }
 
-/* ⚠ 逐飞库的分工：`uart_isr_mask(UART_0)` 已经把这一批字节读进**库的**缓冲
-   （`uart_data_buffer[UART_0]`，最多 16 格，满了会清 FIFO）；`uart_query_byte()` 才是从
-   那个缓冲里取。所以 ISR 里必须**立刻全部搬走**，不能只取一个 —— 取慢了库会丢字节。
-   搬走的字节只进本模块的环形缓冲，解析留给主循环 `route_link_poll()`（解析要写 Flash）。*/
+/* （`uart_data_buffer[UART_0]`，最多 16 格，满了会清 FIFO）；`uart_query_byte()` 才是从
+ * 那个缓冲里取。所以 ISR 里必须**立刻全部搬走**，不能只取一个 —— 取慢了库会丢字节。
+ * 搬走的字节只进本模块的环形缓冲，解析留给主循环 `route_link_poll()`（解析要写 Flash）。
+ */
 void route_link_uart_irq (void)
 {
     uint8 b;

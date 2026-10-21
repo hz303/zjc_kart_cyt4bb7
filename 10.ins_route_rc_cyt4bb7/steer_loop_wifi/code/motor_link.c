@@ -1,31 +1,24 @@
-﻿/*********************************************************************************************************************
- * 双电机速度环(WiFi) - WiFi-SPI 链路实现
+﻿/* 双电机速度环(WiFi) - WiFi-SPI 链路实现
  * 详细协议说明见 motor_link.h
- *
- * 本文件由工作区中已经跑通过的 kart_link.c 裁剪而来：协议、帧格式、解析逻辑逐字节保持一致，
  * 只是把遥测通道的取值改成由 main 写入（motor_link_ch_set），
  * 并去掉了对其它工程变量的依赖，因此可以独立编译。
- ********************************************************************************************************************/
+ */
 
 #include "zf_common_headfile.h"
 #include "motor_link.h"
 #include <float.h>
 
-/*===================================================================================================================
- *  一、参数变量
- *
- *  本工程把这些变量的**定义**放回各自的模块里(见 spd_enc.c / spd_ctrl.c /
- *  spd_safety.c / motor_drv.c), 本文件只通过 motor_link.h 的参数表取它们的地址。
- *  这样"参数属于谁、默认值是多少"只有一处, 不会再出现两边默认值不一致的隐患。
- *=================================================================================================================*/
+/* 一、参数变量
+ * 本工程把这些变量的**定义**放回各自的模块里(见 spd_enc.c / spd_ctrl.c /
+ * spd_safety.c / motor_drv.c), 本文件只通过 motor_link.h 的参数表取它们的地址。
+ * 这样"参数属于谁、默认值是多少"只有一处, 不会再出现两边默认值不一致的隐患。
+ */
 
-/*===================================================================================================================
- *  二、参数表元数据（由 motor_link.h 的 MOTOR_PARAM_TABLE 展开而来）
- *=================================================================================================================*/
+/* 二、参数表元数据（由 motor_link.h 的 MOTOR_PARAM_TABLE 展开而来） */
 typedef struct
 {
     uint8       id;
-    const char *name;       /* 英文名 */
+    const char *name;
     const char *label;      /* "组名|中文标签"（上位机按 | 拆分折叠） */
     float       lo;
     float       hi;
@@ -43,9 +36,7 @@ static const motor_param_t motor_param_meta[] = { MOTOR_PARAM_TABLE(MOTOR_DEF_ME
 
 #define MOTOR_PARAM_COUNT   ((uint8)(sizeof(motor_param_meta) / sizeof(motor_param_meta[0])))
 
-/*===================================================================================================================
- *  三、协议常量与内部状态
- *=================================================================================================================*/
+/* 三、协议常量与内部状态 */
 #define MOTOR_MAGIC_UP_0    (0xA5)
 #define MOTOR_MAGIC_UP_1    (0x5A)
 #define MOTOR_MAGIC_DN_0    (0x5A)
@@ -66,76 +57,69 @@ static const motor_param_t motor_param_meta[] = { MOTOR_PARAM_TABLE(MOTOR_DEF_ME
 #define MOTOR_CMD_SAVE          (0x05)
 #define MOTOR_CMD_LOAD          (0x06)
 #define MOTOR_CMD_GET_TABLE     (0x07)
-#define MOTOR_CMD_ROUTE_DUMP    (0x08)      /* ★ 读路表：车端分帧把 RAM 里的当前表推上来 */
+#define MOTOR_CMD_ROUTE_DUMP    (0x08)
 
 /* 路表 dump 的上行帧类型（与上位机 FrameType.RouteHead/Data/End 逐字节对应）
- *   RouteHead 0x10 : 32 B 表头（= rt_head_t 的前 32 B，**不含两个 CRC**）
- *   RouteData 0x11 : first(4) + n(2) + n × INS_RT_REC_SIZE(16) B
- *   RouteEnd  0x12 : count(4) + lap_mm(4) */
+ * RouteHead 0x10 : 32 B 表头（= rt_head_t 的前 32 B，**不含两个 CRC**）
+ * RouteData 0x11 : first(4) + n(2) + n × INS_RT_REC_SIZE(16) B
+ * RouteEnd  0x12 : count(4) + lap_mm(4)
+ */
 #define MOTOR_FT_ROUTE_HEAD     (0x10)
 #define MOTOR_FT_ROUTE_DATA     (0x11)
 #define MOTOR_FT_ROUTE_END      (0x12)
 
 /* 每帧几条记录：必须让「6 B 头 + n×16 B」不超过 motor_send_frame 的 buf[128]-11 = 117 B
- *   5 条 ⇒ 86 B 载荷 / 97 B 帧。
- *   ⚠ 2026-10-17 从 6 条降到 **5 条**：不是因为 113 B 装不下，而是要压到
- *     **比遥测帧还小**（全量 48 通道 = 213 B，那条路是现场验证过能发的）。
- *     帧越小，模块一次 SPI 事务占用通道的时间越短，抢到空闲窗口的概率越高。 */
+ * 5 条 ⇒ 86 B 载荷 / 97 B 帧。
+ * **比遥测帧还小**（全量 48 通道 = 213 B，那条路是现场验证过能发的）。
+ * 帧越小，模块一次 SPI 事务占用通道的时间越短，抢到空闲窗口的概率越高。
+ */
 #define MOTOR_RD_CHUNK          (5u)
 #define MOTOR_RD_GAP_MS         (5u)        /* 两帧最小间隔：上位机"半路停了"判据是 3 s 无新帧 */
 
-/* 连续多少拍发不出去就放弃（每拍 GAP_MS，200 × 5 ms ≈ 1 s）。
- *   ⚠ 没有这个上限，模块要是长期忙，状态机会一直卡在 HEAD，用户点多少次都没反应。 */
+/* 连续多少拍发不出去就放弃（每拍 GAP_MS，200 × 5 ms ≈ 1 s）。 */
 #define MOTOR_RD_TRY_MAX        (200u)
 
-/* dump 期间把遥测周期压到这么长（原值 5 ms）。dump 期间通道要让给路表，
-   否则 213 B 的遥测帧几乎占满 SPI，dump 永远抢不到。100 ms 够看曲线不"冻"。 */
+/* dump 期间把遥测周期压到这么长（默认 5 ms）。dump 期间通道要让给路表， 否则 213 B 的遥测帧几乎占满 SPI。 */
 #define MOTOR_RD_TEL_MS         (100u)
 
-/* 串口自证：现场判断"命令到没到 / 发出去没"的唯一手段（WiFi 侧丢了不会报错）。
-   排完问题可以改 0。 */
+/* 串口自证：现场判断"命令到没到 / 发出去没"的唯一手段（WiFi 侧丢了不会报错）。 排完问题可以改 0。 */
 #define MOTOR_RD_DEBUG          (1)
 
 /* 使能位：bit1 电机 / bit2 总使能（与上位机 EnableBits 一致） */
 #define MOTOR_EN_MOTOR          (0x0002)
 #define MOTOR_EN_MASTER         (0x0004)
 
-static volatile uint32  motor_tick_ms    = 0;        /* 由 5ms 中断累加        */
-static uint32           motor_tx_ms      = 0;        /* 上次发遥测时刻         */
-static uint32           motor_rx_ms      = 0;        /* 上次尝试收命令时刻     */
-static uint32           motor_rx_last_ms = 0;        /* 最近一次收到下行帧     */
+static volatile uint32  motor_tick_ms    = 0;        /* 由 5ms 中断累加 */
+static uint32           motor_tx_ms      = 0;        /* 上次发遥测时刻 */
+static uint32           motor_rx_ms      = 0;        /* 上次尝试收命令时刻 */
+static uint32           motor_rx_last_ms = 0;        /* 最近一次收到下行帧 */
 static uint8            motor_ever_rx    = 0;
 static uint16           motor_tx_seq     = 0;
-static uint16           motor_enable     = 0;        /* 上位机下发的使能位图   */
+static uint16           motor_enable     = 0;        /* 上位机下发的使能位图 */
 static uint32           motor_tx_count   = 0;
-static uint8            motor_init_err   = 3;        /* 3=还没初始化完         */
+static uint8            motor_init_err   = 3;        /* 3=还没初始化完 */
 
-/* 发送缓冲：全量档案 48 通道 => 帧长 = 11 + 10 + 48*4 = **213 字节**；
-   标定精简档案 18 通道 => 93 字节。缓冲按上限开（256），两种都装得下。
-   帧尺寸是踩过坑的：工程 8 实测 209 B 稳、785 B 收不到 ⇒ 213 B 已验证可发，别再往大堆。 */
+/* 发送缓冲：全量档案 48 通道 => 帧长 = 11 + 10 + 48*4 = **213 字节**； 标定精简档案 18 通道 => 93 字节。缓冲按上限开（256），两种都装得下。 */
 static uint8            motor_txbuf[256];
 /* 接收缓冲 */
 static uint8            motor_rxbuf[256];
 /* 遥测通道值（按上限开：通道数可运行时切，见 s_ch_count） */
 static float            motor_ch[MOTOR_CH_COUNT_MAX];
 
-/* ★ 运行时可切的"遥测档案"与"遥测周期"（见 motor_link.h 顶部说明） */
 volatile float   spd_tel_sel    = 0.0f;                     /* 0 = 全量 / 1 = 标定精简 */
-volatile float   spd_tel_period = (float)MOTOR_TX_PERIOD_MS;/* 遥测周期 ms          */
-static   uint16  s_ch_count     = MOTOR_CH_COUNT;           /* 本拍真正发几个通道   */
+volatile float   spd_tel_period = (float)MOTOR_TX_PERIOD_MS;/* 遥测周期 ms */
+static   uint16  s_ch_count     = MOTOR_CH_COUNT;           /* 本拍真正发几个通道 */
 static   uint16  s_tx_period_ms = MOTOR_TX_PERIOD_MS;       /* 本拍真正用的发送周期 */
 
 /* 库函数要 char*（不能直接传字符串字面量，否则 IAR 会报 const 转换） */
 static char motor_ssid[]       = MOTOR_WIFI_SSID;
 static char motor_pwd[]        = MOTOR_WIFI_PASSWORD;
-static char motor_sock_type[]  = MOTOR_SOCK_TYPE;   /* 别直接写字面量：库函数签名要 char*  */
+static char motor_sock_type[]  = MOTOR_SOCK_TYPE;   /* 别直接写字面量：库函数签名要 char* */
 static char motor_host_ip[]    = MOTOR_HOST_IP;
 static char motor_host_port[]  = MOTOR_HOST_PORT;
 static char motor_local_port[] = MOTOR_LOCAL_PORT;
 
-/*===================================================================================================================
- *  四、小工具：CRC16 与小端读写
- *=================================================================================================================*/
+/* 四、小工具：CRC16 与小端读写 */
 static uint16 motor_crc16 (const uint8 *buf, uint16 len)
 {
     uint16 crc = 0xFFFF;
@@ -200,19 +184,14 @@ static float motor_get_f32 (const uint8 *b, uint16 o)
     return v;
 }
 
-/*===================================================================================================================
- *  五、上行帧发送
- *=================================================================================================================*/
-/* 返回 1 = 这一帧真的交给模块了；0 = 模块忙，本帧没发出去（被跳过）。
-   ★ 参数表的分批发送要靠这个返回值做“发不出去就重试”。 */
+/* 五、上行帧发送 */
+/* 返回 1 = 这一帧真的交给模块了；0 = 模块忙，本帧没发出去（被跳过）。 */
 static uint8 motor_send_frame (uint8 type, const uint8 *payload, uint16 plen)
 {
     uint8  buf[128];
     uint16 n = 0;
 
-    /* ★ 模块忙就直接放弃本帧 —— 遥测可以丢，主循环不能被拖住。
-     *   注意：驱动里的 OTHER_TIME_OUT 保持默认 1000（初始化要靠它），
-     *   运行期就靠这个 INT 判断避免被 wait_idle 卡住。 */
+    /* 注意：驱动里的 OTHER_TIME_OUT 保持默认 1000（初始化要靠它）， 运行期就靠这个 INT 判断避免被 wait_idle 卡住。 */
     if (0 == gpio_get_level(WIFI_SPI_INT_PIN))
     {
         return 0;
@@ -240,12 +219,12 @@ static uint8 motor_send_frame (uint8 type, const uint8 *payload, uint16 plen)
     buf[n ++] = 0x80;
     buf[n ++] = 0x7F;
 
-    /* ★★ 这里必须看返回值！wifi_spi_send_buffer() 返回的是**剩余未发字节数**：
-     *      0      = 全部交给模块了
-     *      length = 一个字节都没发（另一上下文占用 / wait_idle 超时）
-     *   以前这里写的是 `wifi_spi_send_buffer(buf, n); return 1;` ——
-     *   模块忙时帧被静默丢掉，调用方却以为成功了 ⇒ 0x08 的表头丢一次，
-     *   整次 dump 就废（上位机把所有数据帧按"无表头"扔掉），而且没有任何报错。 */
+    /* 0      = 全部交给模块了
+     * length = 一个字节都没发（另一上下文占用 / wait_idle 超时）
+     * 以前这里写的是 `wifi_spi_send_buffer(buf, n); return 1;` ——
+     * 模块忙时帧被静默丢掉，调用方却以为成功了 ⇒ 0x08 的表头丢一次，
+     * 整次 dump 就废（上位机把所有数据帧按"无表头"扔掉），而且没有任何报错。
+     */
     if (0u != wifi_spi_send_buffer(buf, n))
     {
         return 0u;
@@ -282,26 +261,22 @@ static uint8 motor_send_param_value (uint8 id, float v)
 }
 
 /* 参数表逐条上报：ID(1)+LO(4)+HI(4)+DEF(4)+STEP(4)+UNIT(8)+NAME(16)+LABEL(32) = 73 */
-/*===================================================================================================================
- *  参数表：分批发送
- *
- *  注意：这里原来是把 MOTOR_PARAM_COUNT 帧一口气连发，而 motor_send_frame()
- *  遇到“模块忙”会静默丢帧（见上面的 INT 判断）。工程 4 只有 13 项、勉强够；
- *  本工程 16 项就会漏掉几帧，上位机于是拿到一张“混血参数表”：
- *  到货的项用新名字，没到货的项还留着上位机本地的旧名字 —— 而两边的 ID 含义完全不同
- *  （上位机本地 2 号是 k_v，车端 2 号是 duty_limit）。用户照着面板拖滑条，
- *  就把值写进了完全不相干的参数里（最狠的是把占空比限幅写成 0.02%，
- *  现象是“上位机一切正常但电机不动”）。
- *
- *  改成：每 SPD_PARAM_TX_GAP_MS 发一帧，发不出去就下一轮重试同一个 id，
- *  直到全部发完。最多 SPD_PARAM_TX_GAP_MS*16 ms（默认 5ms -> 80ms），
- *  而上位机本来就是“收到第一帧后 300ms 统一重建界面”，体感没有差别。
- *=================================================================================================================*/
+/* 参数表：分批发送
+ * 遇到“模块忙”会静默丢帧（见上面的 INT 判断）。工程 4 只有 13 项、勉强够；
+ * 本工程 16 项就会漏掉几帧，上位机于是拿到一张“混血参数表”：
+ * 到货的项用新名字，没到货的项还留着上位机本地的旧名字 —— 而两边的 ID 含义完全不同
+ * （上位机本地 2 号是 k_v，车端 2 号是 duty_limit）。用户照着面板拖滑条，
+ * 就把值写进了完全不相干的参数里（最狠的是把占空比限幅写成 0.02%，
+ * 现象是“上位机一切正常但电机不动”）。
+ * 改成：每 SPD_PARAM_TX_GAP_MS 发一帧，发不出去就下一轮重试同一个 id，
+ * 直到全部发完。最多 SPD_PARAM_TX_GAP_MS*16 ms（默认 5ms -> 80ms），
+ * 而上位机本来就是“收到第一帧后 300ms 统一重建界面”，体感没有差别。
+ */
 #define SPD_PARAM_TX_GAP_MS     (5u)
 
 static uint8   s_pt_pend = 0;           /* 1 = 有一张参数表等着发 */
-static uint8   s_pt_id   = 0;           /* 下一个要发的参数下标   */
-static uint32  s_pt_ms   = 0;           /* 上次尝试发送的时刻     */
+static uint8   s_pt_id   = 0;           /* 下一个要发的参数下标 */
+static uint32  s_pt_ms   = 0;           /* 上次尝试发送的时刻 */
 
 static void motor_send_param_table (void)
 {
@@ -342,13 +317,12 @@ static void motor_param_table_tick (void)
         return;                         /* 模块忙 -> 本项没发出去，下一轮重试同一个 id */
     }
 
-    /* ★★ 紧接着把【车端当前的数值】也报一份。
-       没有这一步，上位机面板显示的只是它自己的本地值（ParamPanel.MergeTable 只合并
-       名字/量程，**不更新数值**）—— 用户根本分不清"面板上这个 0.005 到底是车上的，
-       还是我自己上次留下的"，照着改就会改错参数。META 帧里只有 lo/hi/def/step，
-       没有"当前值"，所以必须补这一帧。
-       ★ 值没发出去就**不推进 id**，下一轮连同 META 一起重发同一项，
-         保证"面板上出现的每一项，数值都是车上的真值"。 */
+    /* 没有这一步，上位机面板显示的只是它自己的本地值（ParamPanel.MergeTable 只合并
+     * 名字/量程，**不更新数值**）—— 用户根本分不清"面板上这个 0.005 到底是车上的，
+     * 还是我自己上次留下的"，照着改就会改错参数。META 帧里只有 lo/hi/def/step，
+     * 没有"当前值"，所以必须补这一帧。
+     * 保证"面板上出现的每一项，数值都是车上的真值"。
+     */
     if (0 == motor_send_param_value(s_pt_id, *(motor_param_meta[s_pt_id].ptr)))
     {
         return;
@@ -373,9 +347,7 @@ static void motor_send_event (const char *text)
     motor_send_frame(MOTOR_TYPE_EVENT, pl, (uint16)(1 + len));
 }
 
-/*===================================================================================================================
- *  六、遥测：组帧 + 发送
- *=================================================================================================================*/
+/* 六、遥测：组帧 + 发送 */
 static void motor_send_telemetry (void)
 {
     uint16 n = 0;
@@ -392,15 +364,15 @@ static void motor_send_telemetry (void)
     n = motor_put_u16(motor_txbuf, n, motor_tx_seq ++);
     n = motor_put_u32(motor_txbuf, n, motor_tick_ms);
     /* VALID_MASK：0xFFFF = **全部有效**（哨兵值，不是按位图）。
-     * ⚠ 这个字段只有 16 位，而通道数已经 20 个 —— 按位根本表达不下第 17~20 位，
-     *   所以约定"全 1 = 全部有效"。上位机侧 ChannelStore.IsValid() 也按这条解释。
-     *   将来真要做逐通道有效性，必须先把字段扩成 u32（改协议）。 */
+     * 所以约定"全 1 = 全部有效"。上位机侧 ChannelStore.IsValid() 也按这条解释。
+     * 将来真要做逐通道有效性，必须先把字段扩成 u32（改协议）。
+     */
     n = motor_put_u16(motor_txbuf, n, 0xFFFF);
     n = motor_put_u16(motor_txbuf, n, s_ch_count);
 
     for (i = 0; i < (uint8)s_ch_count; i ++)
     {
-        n = motor_put_f32(motor_txbuf, n, motor_ch[i]);     /* ★ 直接拷内存，无格式化 */
+        n = motor_put_f32(motor_txbuf, n, motor_ch[i]);
     }
 
     n = motor_put_u16(motor_txbuf, n, motor_crc16(motor_txbuf + 2, (uint16)(3 + pl)));
@@ -421,18 +393,16 @@ static void motor_send_telemetry (void)
     }
 }
 
-/*===================================================================================================================
- *  六b、路表 dump（0x08 → RouteHead/RouteData/RouteEnd）
- *
- *  设计要点：
- *    ① **分步发**：一次 poll 只发一帧、帧间隔 10 ms ⇒ 主循环不被拖住
- *       （spd_safety 的 200 ms 心跳门靠主循环转）。
- *    ② **数据源是 RAM 里的当前表**（ins_route_get_points / ins_route_pack_records），
- *       不读 Flash —— 读 Flash 是阻塞的，而上位机要的本来就是"你现在正在跑的那张"。
- *    ③ **发不出去就重试**：motor_send_frame() 在模块忙时返回 0，这时**不推进索引**，
- *       否则上位机会缺帧（它自己会补，但每次要白等 3 s 超时）。
- *    ④ 发完结束帧自动回空闲 ⇒ 再点一次「读路表」就是重新来一遍。
- *=================================================================================================================*/
+/* 六b、路表 dump（0x08 → RouteHead/RouteData/RouteEnd）
+ * 设计要点：
+ * ① **分步发**：一次 poll 只发一帧、帧间隔 10 ms ⇒ 主循环不被拖住
+ * （spd_safety 的 200 ms 心跳门靠主循环转）。
+ * ② **数据源是 RAM 里的当前表**（ins_route_get_points / ins_route_pack_records），
+ * 不读 Flash —— 读 Flash 是阻塞的，而上位机要的本来就是"你现在正在跑的那张"。
+ * ③ **发不出去就重试**：motor_send_frame() 在模块忙时返回 0，这时**不推进索引**，
+ * 否则上位机会缺帧（它自己会补，但每次要白等 3 s 超时）。
+ * ④ 发完结束帧自动回空闲 ⇒ 再点一次「读路表」就是重新来一遍。
+ */
 #define MOTOR_RD_IDLE    (0u)
 #define MOTOR_RD_HEAD    (1u)
 #define MOTOR_RD_DATA    (2u)
@@ -440,12 +410,13 @@ static void motor_send_telemetry (void)
 
 static uint8  s_rd_stage = MOTOR_RD_IDLE;
 static uint16 s_rd_next  = 0u;              /* 下一条要发的记录号 */
-static uint32 s_rd_ms    = 0u;              /* 上一帧的时刻（motor_tick_ms）*/
+static uint32 s_rd_ms    = 0u;              /* 上一帧的时刻（motor_tick_ms） */
 static uint16 s_rd_try   = 0u;              /* 当前阶段连续发不出去的次数 */
-static uint16 s_rd_frames= 0u;              /* 本次 dump 已成功发出的数据帧数（只用于自证）*/
+static uint16 s_rd_frames= 0u;
 
 /* 32 B 表头：字段顺序与 rt_head_t 的前 32 B 一致，但**故意手写偏移**而不是 memcpy ——
-   rt_head_t 里 crc_r/crc_h 落在 32 B 之后，memcpy 会把它们一起带上来。 */
+ * rt_head_t 里 crc_r/crc_h 落在 32 B 之后，memcpy 会把它们一起带上来。
+ */
 static uint8 motor_rd_send_head (void)
 {
     const ins_route_head_t *h = ins_route_get_head();
@@ -453,7 +424,7 @@ static uint8 motor_rd_send_head (void)
     uint16 n = 0u;
 
     n = motor_put_u32(b, n, 0x4B525443u);                                   /* CTRK */
-    n = motor_put_u16(b, n, 2u);                                            /* ver */
+    n = motor_put_u16(b, n, 2u);
     n = motor_put_u16(b, n, (uint16)INS_RT_REC_SIZE);                       /* rec_len */
     n = motor_put_u32(b, n, (uint32)h->count);
     n = motor_put_u32(b, n, (uint32)(ins_route_ds * 1000.0f + 0.5f));        /* ds_mm */
@@ -581,9 +552,7 @@ void motor_route_dump_poll (void)
     }
 }
 
-/*===================================================================================================================
- *  七、下行命令解析
- *=================================================================================================================*/
+/* 七、下行命令解析 */
 static void motor_dispatch (uint8 cmd, uint8 pid, uint32 raw, float val, uint16 token)
 {
     uint8 i;
@@ -620,20 +589,17 @@ static void motor_dispatch (uint8 cmd, uint8 pid, uint32 raw, float val, uint16 
             break;
         }
         v = val;
-        if (v < motor_param_meta[pid].lo) v = motor_param_meta[pid].lo;     /* ★ 车端必须钳位 */
+        if (v < motor_param_meta[pid].lo) v = motor_param_meta[pid].lo;
         if (v > motor_param_meta[pid].hi) v = motor_param_meta[pid].hi;
         /* STEP is a UI increment, not a quantizer for received tuning values. */
         *(motor_param_meta[pid].ptr) = v;
         motor_send_param_value(pid, v);                 /* 回读，上位机据此确认 */
 
-        /* ★★ 交叉钳位（2026-10-19）：转向那三个门限有**大小关系**，而滑条是一个个单独拖的，
-           所以能被拖成非法组合 —— 不报错、不越界，只在现场表现成"这套修法没用"：
-             db > brk      ⇒ 滞环带为空 ⇒ 退回单门限（10-18 晚那个逐拍翻向的结构）
-             db >= izone   ⇒ 积分区为空 ⇒ 积分永不累加，静差再也消不掉
-             db = 0        ⇒ |err| 永远 > db，还会让 u_dir 在 err==0 时取 −1
-           实现只有一处：`steer_ctrl_sanitize_thr()`（见 steer_ctrl.c）。
-           ⚠ 只在**下发处**钳，不要每拍在环里钳 —— 否则"上位机显示的"和"车上实跑的"会不一致。
-           ⚠ 被连带改掉的项**必须回读**，否则上位机滑条还停在旧值上。 */
+        /* 所以能被拖成非法组合 —— 不报错、不越界，只在现场表现成"这套修法没用"：
+         * db >= izone   ⇒ 积分区为空 ⇒ 积分永不累加，静差再也消不掉
+         * db = 0        ⇒ |err| 永远 > db，还会让 u_dir 在 err==0 时取 −1
+         * 实现只有一处：`steer_ctrl_sanitize_thr()`（见 steer_ctrl.c）。
+         */
         {
             float db0  = steer.deadband_deg;
             float brk0 = steer.brk_deg;
@@ -664,10 +630,7 @@ static void motor_dispatch (uint8 cmd, uint8 pid, uint32 raw, float val, uint16 
             motor_send_nak(cmd, token, 2);
             break;
         }
-        /* ★ VALUE 字段按"数值"解释（上位机发 6.0f，这里就该得到 6）。
-         *   不能写成 (uint16)raw —— raw 是 IEEE754 的位模式，
-         *   6.0f 的字节是 00 00 C0 40，截 16 位会变成 0x0000，
-         *   后果是"使能怎么都传不下来"，而且不报错。 */
+        /* 不能写成 (uint16)raw —— raw 是 IEEE754 的位模式， 6.0f 的字节是 00 00 C0 40，截 16 位会变成 0x0000， */
         motor_enable = (uint16)(val + 0.5f);
         motor_send_ack(cmd, token);
         break;
@@ -678,9 +641,7 @@ static void motor_dispatch (uint8 cmd, uint8 pid, uint32 raw, float val, uint16 
         break;
 
     case MOTOR_CMD_ROUTE_DUMP:
-        /* ★ 先 ACK 再分帧发：上位机看到 ACK 就知道"命令到了"，
-           之后每 10 ms 一帧（见 motor_route_dump_poll）。
-           表空（count==0）也照样发 head/end —— 让上位机拿到"0 点"而不是超时。 */
+        /* 之后每 10 ms 一帧（见 motor_route_dump_poll）。 表空（count==0）也照样发 head/end —— 让上位机拿到"0 点"而不是超时。 */
         s_rd_next   = 0u;
         s_rd_ms     = motor_tick_ms;
         s_rd_try    = 0u;
@@ -723,17 +684,16 @@ static void motor_parse_rx (uint8 *buf, uint16 len)
         if (buf[i + 2] != MOTOR_TYPE_COMMAND)                              { i ++; continue; }
         if (motor_get_u16(buf, (uint16)(i + 3)) != 8)                      { i ++; continue; }
 
-        /* ★ CRC 不过只前移 1 字节：帧头 5A A5 可能是数据里的巧合字节，
-         *   跳过整帧会连带丢掉后面真正的帧。 */
+        /* 跳过整帧会连带丢掉后面真正的帧。 */
         if (motor_crc16(buf + i + 2, 11) != motor_get_u16(buf, (uint16)(i + 13)))
         {
             i ++;
             continue;
         }
 
-        motor_dispatch(buf[i + 5],                                          /* CMD   */
-                       buf[i + 6],                                          /* ID    */
-                       motor_get_u32(buf, (uint16)(i + 7)),                 /* raw   */
+        motor_dispatch(buf[i + 5],
+                       buf[i + 6],
+                       motor_get_u32(buf, (uint16)(i + 7)),
                        motor_get_f32(buf, (uint16)(i + 7)),                 /* float */
                        motor_get_u16(buf, (uint16)(i + 11)));               /* TOKEN */
 
@@ -741,9 +701,7 @@ static void motor_parse_rx (uint8 *buf, uint16 len)
     }
 }
 
-/*===================================================================================================================
- *  八、对外接口
- *=================================================================================================================*/
+/* 八、对外接口 */
 uint8 motor_link_init (void)
 {
     uint8 ret;
@@ -758,9 +716,9 @@ uint8 motor_link_init (void)
     motor_tx_count   = 0;
 
     /* 1) 连 WiFi 热点
-     * ⚠ 逐飞库里 WIFI_SPI_AUTO_CONNECT 必须保持 0 —— 它内部调用的函数名写错了
-     *   （.c 里写的是 wifi_spi_connect_socket，正确名是 wifi_spi_socket_connect），
-     *   一旦设成 1 或 2 就会编译不过。所以这里手动建连接。 */
+     * （.c 里写的是 wifi_spi_connect_socket，正确名是 wifi_spi_socket_connect），
+     * 一旦设成 1 或 2 就会编译不过。所以这里手动建连接。
+     */
     ret = wifi_spi_init(motor_ssid, motor_pwd);
     if (0 != ret)
     {
@@ -796,14 +754,16 @@ void motor_link_task (void)
 
     if (0 != motor_tick_ms)
     {
-        /*----------------------------------------- 收命令（限频）-----------------------------------------*/
+        /* ----------------------------------------- 收命令（限频）-----------------------------------------
+         * ----------------------------------------- 收命令（限频）-----------------------------------------
+         */
         if ((uint32)(motor_tick_ms - motor_rx_ms) >= MOTOR_RX_PERIOD_MS)
         {
             motor_rx_ms = motor_tick_ms;
 
-            /* ★ 先看 INT 引脚：模块忙就跳过这一轮读取。
-             *   否则 wifi_spi_read_buffer 内部的 wait_idle(OTHER_TIME_OUT) 最长会把
-             *   主循环卡住 1 秒 —— 少收一轮命令没关系，控制循环不能被拖住。 */
+            /* 否则 wifi_spi_read_buffer 内部的 wait_idle(OTHER_TIME_OUT) 最长会把
+             * 主循环卡住 1 秒 —— 少收一轮命令没关系，控制循环不能被拖住。
+             */
             if (0 != gpio_get_level(WIFI_SPI_INT_PIN))
             {
                 n = (uint16)wifi_spi_read_buffer(motor_rxbuf, sizeof(motor_rxbuf));
@@ -814,10 +774,10 @@ void motor_link_task (void)
             }
         }
 
-        /*----------------------------------------- 发遥测（限频）-----------------------------------------
-           ★ dump 期间把周期压到 MOTOR_RD_TEL_MS：全量 48 通道是 213 B/帧，
-             5 ms 一帧几乎占满 WiFi SPI 通道，dump 帧会一直抢不到（现场症状就是
-             "点读路表，一帧都回不来"）。让出 95% 通道，几秒内传完就恢复正常。 */
+        /* ----------------------------------------- 发遥测（限频）-----------------------------------------
+         * 5 ms 一帧几乎占满 WiFi SPI 通道，dump 帧会一直抢不到（现场症状就是
+         * "点读路表，一帧都回不来"）。让出 95% 通道，几秒内传完就恢复正常。
+         */
         {
             uint16 tx_period = s_tx_period_ms;
             if ((MOTOR_RD_IDLE != s_rd_stage) && (tx_period < (uint16)MOTOR_RD_TEL_MS))
@@ -831,13 +791,15 @@ void motor_link_task (void)
             }
         }
 
-        /*----------------------- 参数表分批发送（每次最多一帧，忙就重试）-----------------------
-           必须每圈都调：它自己按 5ms 限频，不能挂在上面那两个限频分支里。 */
+        /* ----------------------- 参数表分批发送（每次最多一帧，忙就重试）-----------------------
+         * 必须每圈都调：它自己按 5ms 限频，不能挂在上面那两个限频分支里。
+         */
         motor_param_table_tick();
 
-        /*----------------------- 路表 dump（0x08 之后每 10 ms 一帧）-----------------------
-           同样每圈都调：它自己按 MOTOR_RD_GAP_MS 限频，空闲时第一行就返回。
-           [!] 别挂进上面"发遥测"那个分支：遥测周期可被调到 200 ms，dump 会被拖到几分钟。 */
+        /* ----------------------- 路表 dump（0x08 之后每 10 ms 一帧）-----------------------
+         * 同样每圈都调：它自己按 MOTOR_RD_GAP_MS 限频，空闲时第一行就返回。
+         * [!] 别挂进上面"发遥测"那个分支：遥测周期可被调到 200 ms，dump 会被拖到几分钟。
+         */
         motor_route_dump_poll();
     }
 }
@@ -891,19 +853,16 @@ uint8 motor_link_ever_rx (void)
 
 void motor_link_ch_set (uint8 idx, float v)
 {
-    if (idx < MOTOR_CH_COUNT_MAX)       /* ★ 按【上限】判, 通道数可运行时切 */
+    if (idx < MOTOR_CH_COUNT_MAX)
     {
         motor_ch[idx] = v;
     }
 }
 
-/*===================================================================================================================
- *  ★★ 运行时切换遥测档案(通道数) / 遥测周期
- *     由 main 每圈按参数 tel_sel / tel_period 推一次（见 motor_link.h 顶部说明）。
- *     ⚠ 切通道数时**不做任何补零/搬运**：只改帧头 COUNT 与发包循环长度。
- *       没被填过的通道会是上一轮残留值 —— 上位机在切换那一两帧看到的可能是旧数，
- *       这是可以接受的（不需要为它加同步机制）。
- *=================================================================================================================*/
+/* 由 main 每圈按参数 tel_sel / tel_period 推一次（见 motor_link.h 顶部说明）。
+ * 没被填过的通道会是上一轮残留值 —— 上位机在切换那一两帧看到的可能是旧数，
+ * 这是可以接受的（不需要为它加同步机制）。
+ */
 void motor_link_set_ch_count (uint16 n)
 {
     if (n < 1u)                    { n = 1u; }

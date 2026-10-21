@@ -28,7 +28,7 @@ zjc_kart_cyt4bb7/
 │   ├── build.bat                   命令行编译（两个核）
 │   ├── libraries/                  逐飞 Seekfree CYT4BB7 库
 │   ├── tools/                      开发期 Python 小工具
-│   └── speed_loop_wifi/            IAR 工程本体
+│   └── steer_loop_wifi/            固件源码 code/ + user/（IAR 工程文件未入库，可从 git 历史恢复）
 │
 ├── 9.steer_rc_wifi_cyt4bb7/        车端固件 —— 工程 9（**卡丁本体**）
 │   ├── 00-工程9-遥控与引脚移植说明.md  ★ 引脚总表 / 极性复核 / 遥控通道分配 / 历次修订
@@ -36,17 +36,16 @@ zjc_kart_cyt4bb7/
 │   ├── 01-上电标定卡.md             速度环标定
 │   ├── 02-转向标定卡.md             转向位置环标定
 │   ├── build.bat / libraries/ / tools/
-│   └── steer_loop_wifi/            IAR 工程本体
+│   └── steer_loop_wifi/            固件源码 code/ + user/（IAR 工程文件未入库，可从 git 历史恢复）
 │       ├── code/                   spd_enc / spd_ctrl / spd_safety / motor_drv /
 │       │                           motor_link / steer_abs / steer_ctrl / remote_ctrl
 │       ├── user/                   main_cm7_0.c、cm7_0_isr.c（CM7_1 为空工程）
-│       └── iar/                    cyt4bb7.eww + project_config/*.ewp
 │
 ├── 10.ins_route_rc_cyt4bb7/        车端固件 —— 工程 10（工程 9 复制 + 引脚二次移植）
 │   ├── 00-工程9-遥控与引脚移植说明.md  ★ 引脚总表（以其中「按队友 ca55f2b 换脚」修订为准）
 │   ├── 00-README.md / 01-上电标定卡.md / 02-转向标定卡.md
 │   ├── build.bat / libraries/ / tools/
-│   └── steer_loop_wifi/            IAR 工程本体（结构同工程 9）
+│   └── steer_loop_wifi/            固件源码 code/ + user/（结构同工程 9，IAR 工程文件未入库）
 │
 ├── 12.proto_pp_cyt4bb7/            车端固件 —— 工程 12（路表 + 纯跟踪主线，无独立文档）
 │   ├── libraries/                  逐飞 Seekfree CYT4BB7 库
