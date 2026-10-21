@@ -379,7 +379,7 @@ static void motor_print_status (void)
         ra = pf2(RC_Steer_Deg, &rd);
         rs = pf2(RC_Scale * 1000.0f, &rsf);
 
-        printf("        RC  eng=%u st=%u arm=%u estop=%u ch5=%u ch6=%u deg=%d.%02d thr=%d scale=%d frm=%lu local=%u tel=%u/%ums\r\n",
+        printf("        RC  eng=%u st=%u arm=%u estop=%u ch5=%u ch6=%u deg=%d.%02d thr=%d scale=%d mid=%u/%u frm=%lu local=%u tel=%u/%ums\r\n",
                (unsigned)RC_Engage,
                (unsigned)RC_Online,
                (unsigned)RC_Arm,
@@ -388,6 +388,7 @@ static void motor_print_status (void)
                (unsigned)RC_Raw_Ch6,
                ra, rd,
                rt, rs,
+               (unsigned)RC_Steer_Mid, (unsigned)RC_Thr_Mid,
                (unsigned long)RC_Frames,
                (unsigned)spd_safety_local(),
                (unsigned)motor_link_ch_count(),

@@ -179,12 +179,32 @@ void head_test_tick (void)
     }
     s_err = ht_wrap180(s_tar - o.yaw);
 
-    /* ---- 4) 下发：航向外环 + 恒定后轮 rps ---- */
+    /* ---- 4) 下发：航向外环 + 恒定后轮 rps（**带电子差速**）----
+     *
+     *  ★★ 2026-10-21：原来这里是 `spd_target_l = spd_target_r = ht_rps`，即**不给差速**。
+     *     后果（实测）：转弯时内轮被外轮拖着走 ⇒ 内轮编码器**多读** ⇒
+     *       · `(v_r − v_l)` 偏小 ⇒ "陀螺 / 轮速差" 算出来 1.27（看着像 yaw 刻度错，其实不是）；
+     *       · 航向测试自己给的 rps 与真实地面速度不一致 ⇒ 上升时间/超调都不可比；
+     *       · 内轮拖地还会让车**欠转**（同样的 δ 转不到理论半径）。
+     *     ⇒ 换成与遥控/回放**完全同一条律**（见 `工程10-控制层-航向追随与电子差速.md`）：
+     *         κ = tan(实测δ)/L，v_l,r = v(1 ∓ κ·W/2)；平均仍是 v，所以里程口径不变。
+     *     ⚠ 用**实测**舵角，不用目标角：目标角会让后轮在舵机到位之前就提前差速。
+     *     ⚠ 单位：`spd_target_*` 是 rps，而 `spd_diff_alloc` 吃 m/s ⇒ 进乘 m_per_rev、出去除回去。
+     */
     steer_ctrl_set_head_kp(ht_k);
     steer_ctrl_set_target_yaw(s_tar);
 
-    spd_target_l = ht_rps;
-    spd_target_r = ht_rps;
+    {
+        float mpr   = (ins_m_per_rev > 1e-4f) ? ins_m_per_rev : 0.8193f;
+        float v_mps = ht_rps * mpr;
+        float vl    = v_mps;
+        float vr    = v_mps;
+
+        spd_diff_alloc(v_mps, pb_l, steer_ctrl_get_meas_delta(), &vl, &vr);
+
+        spd_target_l = vl / mpr;
+        spd_target_r = vr / mpr;
+    }
 
     /* ---- 5) 上升时间（进 ±1° 的那一刻，记一次）---- */
     if ((0u == s_rise) && (fabsf(s_err) < 1.0f))
@@ -196,7 +216,22 @@ void head_test_tick (void)
     /* ---- 6) 段推进 / 打印 ---- */
     if ((uint8)HT_MODE_FIXED == s_mode)
     {
-        /* 固定航向：不结束，每秒打一行，方便串口看趋势 */
+        /* ★ 2026-10-21：模式① 也按 `ht_dwell` **自动停**。
+           原来只有台阶模式用它，于是 App 上"时长 s 15"对固定航向是个**摆设**：
+           填 15 实际要么一直跑、要么被安全门提前掐掉，现场只看到"怎么才几秒"。
+           现在时长到点就收：停车 + ht_mode 归 0（App 那边也跟着变成"没在跑"）。 */
+        if ((ht_dwell >= 0.5f) && (s_ticks >= (uint32)(ht_dwell * 200.0f)))
+        {
+            printf("[HT] 固定航向到时长 %u s，停 (yaw=%d.%01d err=%d.%01d)\r\n",
+                   (unsigned)ht_dwell,
+                   (int)o.yaw,      (int)(fabsf(o.yaw) * 10.0f) % 10,
+                   (int)s_err,      (int)(fabsf(s_err) * 10.0f) % 10);
+            ht_stop("时长到");
+            ht_mode = 0.0f;
+            return;
+        }
+
+        /* 固定航向：每秒打一行，方便串口看趋势 */
         s_print ++;
         if (s_print >= 200u)                    /* 200 × 5 ms = 1 s */
         {

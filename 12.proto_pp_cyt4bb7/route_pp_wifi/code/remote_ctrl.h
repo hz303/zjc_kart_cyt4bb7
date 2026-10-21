@@ -125,6 +125,26 @@
 #define RC_STEER_DEADBAND       (8)
 #define RC_THR_DEADBAND         (8)
 
+/* ★★ 2026-10-21：中位改成**学习值**（现场实测：扳机静止位读 968，而 992 是写死的）。
+ *
+ *   症状：车不动时 target_l/target_r 恒 **-0.06 rps**。
+ *   算式：(968-992)/800 = -0.03 的归一化油门 × rc_thr_max(2.0) = **-0.06** —— 一个计数都对得上。
+ *   根因不是"忘设死区"，而是**死区只有 ±8，而这只发射机的中位偏了 24**。
+ *   死区加大能压住，但换一支发射机/重新微调就又偏 ⇒ 改成**学中位**，死区继续 ±8。
+ *
+ *   学习规则（两段）：
+ *     ① 开机捕获：前 20 帧内，若 raw 落在 992±80 里 ⇒ 直接把它当"静止位"锁下来（上电时手不会按着杆）；
+ *     ② 慢跟踪：之后每 100 ms 最多挪 1 个计数，只在 |raw - mid| ≤ 40（"看着像中位"）时才挪
+ *        ⇒ 24 个计数约 2.4 s 收敛；而**推杆**（几百计数）永远在 40 之外，不会被当成中位漂移学掉。
+ *   ⚠ 只调中位，**不动量程**（±800）。所以 lo/hi 跟着 mid 一起平移，满杆仍然是 ±1.0。
+ *   ⚠ 这两个量是**运行期**值（不是编译常量）⇒ 遥测/串口要看就用 RC_Thr_Mid / RC_Steer_Mid。 */
+#define RC_MID_CAP_BAND         (80)        /* 开机捕获：|raw - 标称中位| 允许多大 */
+#define RC_MID_TRACK_BAND       (100)       /* 慢跟踪：只有"看着像中位"才允许挪。
+                                               ⚠ **必须 > CAP_BAND**：否则开机捕获偏了 41~80 时，
+                                                 静止值的偏差落在跟踪带外 ⇒ 永远修不回来（死锁）。 */
+#define RC_MID_TRACK_STEP       (1)         /* 慢跟踪：每次最多挪几个计数 */
+#define RC_MID_TRACK_MS         (100u)      /* 慢跟踪：多久挪一次（1 计数/100ms）*/
+
 /* 油门满杆对应的目标转速 rps（在线可改，见参数表 rc_thr_max）。
    ⚠ 队友的 10 计数/10ms ≈ 0.54 rps，那是他第一版跑通用的保守值；本工程默认给 2.0 rps，
      第一次上车请按 01-上电标定卡.md 从小往大加。 */
@@ -208,6 +228,8 @@ extern volatile float   RC_Steer_Deg;       /* 方向盘指令角（度，向右
 extern volatile float   RC_Steer_Norm;      /* CH1 归一化 -1~+1（已过中位死区） */
 extern volatile uint8   RC_Ch3_Pct;         /* CH3 二值：0 = 低(航向) / 100 = 高(舵机) */
 extern volatile uint8   RC_Stick_Bad;       /* 通道掉线位图 bit0=CH1 bit1=CH2 bit2=CH3（raw 过低）*/
+extern volatile uint16  RC_Thr_Mid;         /* ★ 学习到的油门中位（上电捕获 + 慢跟踪，不是常量 992）*/
+extern volatile uint16  RC_Steer_Mid;       /* ★ 学习到的方向盘中位 */
 extern volatile uint8   RC_Hdg_Mode;        /* 1 = CH1 正在控制航向；0 = 控制舵机角 */
 extern volatile uint16  RC_Hdg_Thr;         /* CH3 当前判高/低的阈值（运行时自适应）*/
 extern volatile uint8   RC_Hdg_Cal;         /* 1 = CH3 已经标定过（见过开关两端） */

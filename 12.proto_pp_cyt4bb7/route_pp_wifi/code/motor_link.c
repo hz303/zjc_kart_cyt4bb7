@@ -768,15 +768,32 @@ static void motor_dispatch (uint8 cmd, uint8 pid, uint32 raw, float val, uint16 
     case MOTOR_CMD_ROUTE_DUMP:
         /* ★ 先 ACK 再分帧发：上位机看到 ACK 就知道"命令到了"，
            之后每 10 ms 一帧（见 motor_route_dump_poll）。
-           表空（count==0）也照样发 head/end —— 让上位机拿到"0 点"而不是超时。 */
-        s_rd_next   = 0u;
+           表空（count==0）也照样发 head/end —— 让上位机拿到"0 点"而不是超时。
+
+           ★★ 2026-10-21：VALUE 字段 = **起始索引**（0 = 从头）。
+              手机端要"边录边看"，每次都重传整张表太浪费（2048 点 = 32 KB / 410 帧 / 4 s），
+              带索引就只传新增那几十点。head 里照样报**总点数**，界面上不会因此看不到全貌。
+              ⚠ 越界/负值/NaN 一律当 0 ⇒ 老上位机（VALUE 恒 0）行为完全不变。 */
+        {
+            uint16 from = 0u;
+            uint16 cnt  = ins_route_get_count();
+
+            if ((val >= 1.0f) && (val < 65000.0f))
+            {
+                from = (uint16)(val + 0.5f);
+            }
+            if (from > cnt) { from = cnt; }
+
+            s_rd_next = from;
+        }
         s_rd_ms     = motor_tick_ms;
         s_rd_try    = 0u;
         s_rd_frames = 0u;
         s_rd_stage  = MOTOR_RD_HEAD;
         motor_send_ack(cmd, token);
 #if MOTOR_RD_DEBUG
-        printf("[RD] cmd 0x08: %u pts\r\n", (unsigned)ins_route_get_count());
+        printf("[RD] cmd 0x08 from %u / %u pts\r\n",
+               (unsigned)s_rd_next, (unsigned)ins_route_get_count());
 #endif
         break;
 

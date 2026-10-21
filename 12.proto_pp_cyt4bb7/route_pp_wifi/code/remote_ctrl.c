@@ -13,6 +13,7 @@
 #include "ins_odom.h"           /* ins_m_per_rev：rps <-> m/s */
 #include "route_pb.h"           /* pb_l：与回放共用同一个有效轴距 */
 #include "proto.h"              /* ★ 驱动令牌 / 急停的唯一入口 */
+#include "motor_link.h"         /* motor_link_now_ms()：中位学习要一个毫秒时基 */
 
 
 /*===================================================================================================================
@@ -29,6 +30,8 @@ volatile float   RC_Steer_Norm  = 0.0f;
 volatile uint8   RC_Ch3_Pct     = 100u;
 volatile uint8   RC_Stick_Bad   = 0u;       /* bit0 CH1 / bit1 CH2 / bit2 CH3 的 raw 低于有效下限 */
 volatile uint8   RC_Hdg_Mode    = 0u;
+volatile uint16  RC_Thr_Mid     = RC_THR_MID;       /* 学习到的油门中位（见 remote_ctrl.h 的 RC_MID_* ）*/
+volatile uint16  RC_Steer_Mid   = RC_STEER_MID;     /* 学习到的方向盘中位 */
 volatile uint16  RC_Hdg_Thr     = RC_SW_VAL_MID;   /* CH3 阈值：自适应，见 rc_ch3_track() */
 volatile uint8   RC_Hdg_Cal     = 0u;              /* 1 = 已标定（见过开关两端） */
 volatile float   RC_Hdg_Step    = 1.0f;
@@ -87,6 +90,72 @@ static uint8 rc_pick2 (uint16 v, uint8 active_high)
 static float rc_fabs (float v)
 {
     return (v < 0.0f) ? -v : v;
+}
+
+/*----------------------------------------------------------
+ * 中位学习：把"扳机/方向盘的静止位"学出来，而不是永远假设 992
+ *
+ *   现场（2026-10-21）：扳机静止位 968，代码写死 992 ⇒ 差 24 计数、超出 ±8 死区
+ *   ⇒ 归一化油门 -0.03 ⇒ target -0.06 rps，车自己慢慢倒。
+ *   ⚠ 这不是"死区忘了设"，是**中位不是 992**。死区加大只是把偏差盖住，换发射机又犯。
+ *----------------------------------------------------------*/
+static uint8  s_mid_locked = 0u;        /* 0 = 还在开机捕获阶段 */
+static uint32 s_mid_ms     = 0u;
+
+static void rc_mid_step (volatile uint16 *mid, uint16 raw)
+{
+    int d = (int)raw - (int)(*mid);
+
+    /* 明显不是中位（手在推/扳着）⇒ 一个计数都不许动，否则推杆会把中位学跑 */
+    if ((d > RC_MID_TRACK_BAND) || (d < -RC_MID_TRACK_BAND)) { return; }
+
+    if (d >= RC_MID_TRACK_STEP)        { *mid = (uint16)(*mid + RC_MID_TRACK_STEP); }
+    else if (d <= -RC_MID_TRACK_STEP)  { *mid = (uint16)(*mid - RC_MID_TRACK_STEP); }
+}
+
+static void rc_mid_learn (void)
+{
+    uint32 now = motor_link_now_ms();
+    int    d1, d2;
+
+    if (0u == s_mid_locked)
+    {
+        /* ① 开机捕获：收到 3 帧以后、20 帧以前，取一次"看起来是静止位"的值。
+              ⚠ 用 ±RC_MID_CAP_BAND 兜住"上电时手就按着杆"的情况：偏太多就不认，保持标称值。 */
+        if ((RC_Frames >= 3u) && (RC_Frames <= 20u) && (0u == (RC_Stick_Bad & 0x03u)))
+        {
+            d1 = (int)RC_Raw_Ch1 - RC_STEER_MID;
+            d2 = (int)RC_Raw_Ch2 - RC_THR_MID;
+
+            if ((d1 <= RC_MID_CAP_BAND) && (d1 >= -RC_MID_CAP_BAND))
+            {
+                RC_Steer_Mid = RC_Raw_Ch1;
+            }
+            if ((d2 <= RC_MID_CAP_BAND) && (d2 >= -RC_MID_CAP_BAND))
+            {
+                RC_Thr_Mid = RC_Raw_Ch2;
+            }
+
+            s_mid_locked = 1u;
+            s_mid_ms     = now;
+
+            printf("[RC] mid captured: steer=%u thr=%u (nominal 992/992)\r\n",
+                   (unsigned)RC_Steer_Mid, (unsigned)RC_Thr_Mid);
+        }
+        return;
+    }
+
+    /* ② 慢跟踪：1 计数 / 100 ms，且只在"看着像中位"时挪。
+       ⚠⚠ **必须排除"遥控正在开车(ON)"这一段**：否则司机稳稳按住一个小油门（比如 50 计数），
+          100 ms 挪 1 个 → 5 s 就被当成"中位漂移"学掉 ⇒ 车越走越慢。这不是理论风险，
+          是"学习式中位"这类实现的经典坑。
+          OFF/STANDBY 时本来要求油门回中（进 ON 也要油门先回中），所以那两段学中位是安全的。 */
+    if ((RC_ENGAGE_ON != RC_Engage) && ((uint32)(now - s_mid_ms) >= RC_MID_TRACK_MS))
+    {
+        s_mid_ms = now;
+        rc_mid_step(&RC_Steer_Mid, RC_Raw_Ch1);
+        rc_mid_step(&RC_Thr_Mid,   RC_Raw_Ch2);
+    }
 }
 
 /*----------------------------------------------------------
@@ -362,13 +431,16 @@ void remote_ctrl_update (void)
        现场症状就是题述的"CH1 为 0 时一给油，方向盘莫名其妙打一个角"——
        其实是"方向盘被判成左满舵"，只是 OFF/STANDBY 不写转向，一合闸才看得见。
        ⇒ raw 低于有效下限时按"摇杆回中"处理，并记进 RC_Stick_Bad（屏幕那一行看得见）。 */
+    /* ★ 先把中位学出来（必须在下面所有"减中位"之前） */
+    rc_mid_learn();
+
     RC_Stick_Bad = 0u;
     if (RC_Raw_Ch1 < RC_CH_VALID_MIN) { RC_Stick_Bad |= 0x01u; }
     if (RC_Raw_Ch2 < RC_CH_VALID_MIN) { RC_Stick_Bad |= 0x02u; }
     if (RC_Raw_Ch3 < RC_CH_VALID_MIN) { RC_Stick_Bad |= 0x04u; }
 
     {
-        int d = (int)RC_Raw_Ch1 - RC_STEER_MID;
+        int d = (int)RC_Raw_Ch1 - (int)RC_Steer_Mid;    /* ★ 去掉的是**学到的**中位，不是常量 992 */
 
         if ((0u != (RC_Stick_Bad & 0x01u)) ||
             ((d <= RC_STEER_DEADBAND) && (d >= -RC_STEER_DEADBAND)))
@@ -380,14 +452,18 @@ void remote_ctrl_update (void)
         }
         else
         {
+            /* 量程跟着中位一起平移（span 不变）⇒ 满杆仍然是 ±1.0，只是 0 点对到了真实静止位 */
             RC_Steer_Norm = (float)RC_STEER_DIR_SIGN
-                          * rc_norm(RC_Raw_Ch1, RC_STEER_MID, RC_STEER_MIN, RC_STEER_MAX);
+                          * rc_norm(RC_Raw_Ch1,
+                                    (int)RC_Steer_Mid,
+                                    (int)RC_Steer_Mid - (RC_STEER_MID - RC_STEER_MIN),
+                                    (int)RC_Steer_Mid + (RC_STEER_MAX - RC_STEER_MID));
             RC_Steer_Deg  = RC_Steer_Norm * steer_ctrl_eff_limit();
         }
     }
 
     /* 油门：同样 ±RC_THR_DEADBAND 死区，把静止抖动压成 0（队友实测中位在 988/990/992 之间跳） */
-    thr = (int)RC_Raw_Ch2 - RC_THR_MID;
+    thr = (int)RC_Raw_Ch2 - (int)RC_Thr_Mid;     /* ★ 同上：学到的中位 */
     if ((0u != (RC_Stick_Bad & 0x02u)) ||
         ((thr <= RC_THR_DEADBAND) && (thr >= -RC_THR_DEADBAND)))
     {
@@ -395,7 +471,10 @@ void remote_ctrl_update (void)
     }
     else
     {
-        RC_Throttle = rc_norm(RC_Raw_Ch2, RC_THR_MID, RC_THR_MIN, RC_THR_MAX);
+        RC_Throttle = rc_norm(RC_Raw_Ch2,
+                              (int)RC_Thr_Mid,
+                              (int)RC_Thr_Mid - (RC_THR_MID - RC_THR_MIN),
+                              (int)RC_Thr_Mid + (RC_THR_MAX - RC_THR_MID));
     }
 
     RC_Scale = RC_SCALE_MAX;    /* 恒 1.0，见上面那段：行程在发射机侧缩 */

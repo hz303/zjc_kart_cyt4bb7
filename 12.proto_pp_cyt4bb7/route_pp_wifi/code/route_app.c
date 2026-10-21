@@ -8,6 +8,7 @@
 #include "ins_route.h"
 #include "route_link.h"
 #include "route_app.h"
+#include "route_pb.h"      /* ★ 回放状态：rt_st 的 PLAY 位（2026-10-21 补上，以前这个位永远是 0）*/
 
 /* ---- 命令量（绑定到参数表 ID 38/40/41/42/53）---- */
 volatile float rt_rec_cmd  = 0.0f;
@@ -248,6 +249,11 @@ uint16 route_app_status (void)
     if (0u != ins_route_flash_busy())                       { st |= RT_ST_SAVING;   }
     if (0u != ins_route_flash_loaded())                     { st |= RT_ST_FROMFLSH; }
     if (0u != route_link_active())                          { st |= RT_ST_LINK;     }
+
+    /* ★ 2026-10-21：这个位**以前根本没人置**（RT_ST_PLAY 定义了但没写）⇒ 遥测/CSV 里
+       "回放中"是看不出来的：17:25 那份记录里 pb 明明在跑（满舵 + pb_elat=38 m），
+       rt_st 却一直是 68(HAVE|FROMFLSH)，排查时被误导了一大圈。 */
+    if (0u != route_pb_active())                            { st |= RT_ST_PLAY;     }
 
     rc = ins_route_flash_last_rc();
     if (2u == rc)                                           { st |= RT_ST_SAVEFAIL; }

@@ -113,8 +113,8 @@
     X(35, "ins_odom_en","惯导|航位推算使能",    0.000f,    1.000f,   1.000f, "-",     1.000f, &ins_odom_enable,     P_RW_LIVE, G_INS  ) \
     X(36, "ins_slip",   "惯导|打滑门限",        0.000f,  100.000f,  30.000f, "%",     1.000f, &ins_slip_pct,        P_RW_LIVE, G_INS  ) \
     X(37, "ins_zero",   "惯导|位姿归零(0>1)",   0.000f,    1.000f,   0.000f, "-",     1.000f, &ins_zero_cmd,        P_CMD,     G_INS  ) \
-    X(38, "rt_rec",     "路表|录制(0>1开/1>0停)",0.000f,   1.000f,   0.000f, "-",     1.000f, &rt_rec_cmd,          P_CMD,     G_RT   ) \
-    X(39, "rt_ds",      "路表|采样点距",       0.050f,    0.150f,   0.050f, "m",     0.010f, &ins_route_ds,        P_RW_IDLE, G_RT   ) \
+    X(38, "rt_rec",     "路表|录制(0>1开/1>0停)",0.000f,   1.000f,   0.000f, "-",     1.000f, &rt_rec_cmd,          P_RW_LIVE, G_RT   ) /* 2026-10-21: P_CMD -> P_RW_LIVE（录表不产生运动量，遥控合闸时也允许按）*/ \
+    X(39, "rt_ds",      "路表|采样点距",       0.050f,    0.150f,   0.050f, "m",     0.010f, &ins_route_ds,        P_RW_LIVE, G_RT   ) /* 2026-10-21: P_RW_IDLE -> P_RW_LIVE（手机录表时人正拿遥控开车，IDLE 会被令牌挡住；它只改采样阈值，不产生运动量。录制中改只影响之后的点）*/ \
     X(40, "rt_slot",    "路表|当前槽(0~4)",    0.000f,    4.000f,   0.000f, "-",     1.000f, &rt_slot_cmd,         P_CMD,     G_RT   ) \
     X(41, "rt_load",    "路表|重载槽(0>1)",    0.000f,    1.000f,   0.000f, "-",     1.000f, &rt_load_cmd,         P_CMD,     G_RT   ) \
     X(42, "rt_save",    "路表|存到槽(0>1)",    0.000f,    1.000f,   0.000f, "-",     1.000f, &rt_save_cmd,         P_CMD,     G_RT   ) \
@@ -128,7 +128,7 @@
     X(50, "pb_ld_b",    "回放|前视随速",       0.000f,    1.000f,   0.200f, "m/(m/s)",0.005f,&pb_ld_b,             P_RW_LIVE, G_PB   ) \
     X(51, "pb_ld_min",  "回放|前视下限",       0.100f,    2.000f,   0.300f, "m",     0.010f, &pb_ld_min,           P_RW_LIVE, G_PB   ) \
     X(52, "pb_ld_max",  "回放|前视上限",       0.300f,    5.000f,   1.500f, "m",     0.010f, &pb_ld_max,           P_RW_LIVE, G_PB   ) \
-    X(53, "rt_mark",    "路表|标记关键点(0>1)",0.000f,    1.000f,   0.000f, "-",     1.000f, &rt_mark_cmd,         P_CMD,     G_RT   ) \
+    X(53, "rt_mark",    "路表|标记关键点(0>1)",0.000f,    1.000f,   0.000f, "-",     1.000f, &rt_mark_cmd,         P_RW_LIVE, G_RT   ) /* 2026-10-21: P_CMD -> P_RW_LIVE（打点只是存个坐标，不产生运动量；遥控开车时必须能按）*/ \
     X(54, "pb_ff_en",   "回放|打角前馈使能",   0.000f,    1.000f,   0.000f, "-",     1.000f, &pb_ff_en,            P_RW_LIVE, G_PB   ) \
     X(55, "pb_ff",      "回放|前馈增益",       0.000f,    2.000f,   1.000f, "-",     0.050f, &pb_ff_gain,          P_RW_LIVE, G_PB   ) \
     X(56, "df_en",      "差速|电子差速使能",   0.000f,    1.000f,   1.000f, "-",     1.000f, &spd_diff_en,         P_RW_LIVE, G_SPD  ) \
@@ -146,7 +146,7 @@
     X(68, "pb_fin",     "回放|终点判定半径",   0.020f,    1.000f,   0.150f, "m",     0.010f, &pb_fin,              P_RW_LIVE, G_PB   ) \
     X(69, "ht_mode",    "测试|0关1定角2台阶",  0.000f,    2.000f,   0.000f, "-",     1.000f, &ht_mode,             P_CMD,     G_TEST) \
     X(70, "ht_rps",     "测试|后轮 rps",       0.100f,    6.000f,   1.200f, "rps",   0.100f, &ht_rps,              P_RW_LIVE, G_TEST) \
-    X(71, "ht_yaw",     "测试|目标航向(相对)",-60.000f,   60.000f,   0.000f, "deg",   1.000f, &ht_yaw,              P_RW_LIVE, G_TEST) \
+    X(71, "ht_yaw",     "测试|目标航向(相对)",-180.000f, 180.000f,   0.000f, "deg",   1.000f, &ht_yaw,              P_RW_LIVE, G_TEST) /* 2026-10-21: ±60 -> ±180（原来填 90 被钳成 60；再大没意义，误差会 wrap）*/ \
     X(72, "ht_dwell",   "测试|每段停留",       0.500f,   30.000f,   3.000f, "s",     0.500f, &ht_dwell,            P_RW_LIVE, G_TEST) \
     X(73, "ht_step",    "测试|台阶幅值",       1.000f,   30.000f,   5.000f, "deg",   1.000f, &ht_step,             P_RW_LIVE, G_TEST) \
     X(74, "ht_n",       "测试|段数",           1.000f,   40.000f,   8.000f, "段",    1.000f, &ht_n,                P_RW_LIVE, G_TEST) \

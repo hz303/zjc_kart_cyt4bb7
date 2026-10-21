@@ -88,6 +88,23 @@ extern volatile float pb_fin;       /* 68 ★ 终点判定半径 m              
 #define PB_MIN_POINTS       (10u)
 #define PB_END_SLOW_M       (1.0f)          /* 末段收油距离 m                        */
 #define PB_NEAR_WIN         (40u)           /* 最近点前向搜索窗（点）= 2 m           */
+/* ★ 2026-10-21：起点对齐阈值。路表头里存的是**录制那一刻的 odom**（origin_x/y/yaw），
+   而 odom 相对上电 —— 中间断过电或按过 ins_zero 就对不上，车会被指到几十米外。
+   ⇒ 按 origin 换算出来的位置离表起点超过这个距离，就退回"车现在就在第 0 点"。 */
+#define PB_ALIGN_MAX_M      (2.0f)
+/* ★ 回放速度上限 = 表里记录的**最大车速** × 它（只降不升）。
+   表是"人当时开得动"的速度：按 0.74 m/s 录的 8 字，用 pb_vmax=1.5 去跑，
+   等于 2 倍速过同一个弯 ⇒ 转向跟不上、每次都冲出去（现场"跑成一条大弧"）。 */
+/* ★ 2026-10-21（照 Polaris kart_playback.h）：倒车段 / 换向点。量纲换算成 m/s。 */
+#define PB_REV_EPS          (0.10f)     /* 倒车判定死区 m/s（Polaris 2.0 脉冲/5ms ≈ 0.147）*/
+#define PB_REV_CREEP        (0.15f)     /* 换向前那一点的爬行速度 m/s（Polaris 0.25）*/
+/* ★ 急停去抖（5 ms/拍）：连续这么多拍才中止回放。
+   20 ms 的单拍毛刺（SBUS 坏帧让 CH5 瞬间越过中位）不该废掉一整趟；
+   真正的急停远长于 20 ms，安全层的硬停机本来也是**当拍**生效、不等这里。 */
+#define PB_ESTOP_TICKS      (4u)
+#define PB_REV_HEAD_KP      (0.0f)      /* 倒车航向 P 纠偏 deg/deg：Polaris 用 20 计数/度≈1.5，
+                                           我们倒车段只有 0.7 m ⇒ 先 0（纯开环）。要开先确认符号，
+                                           反了是正反馈发散 */
 
 /* ---- 状态（遥测用；`pb_state` 上能区分"跑完"和"跑飞"）--------------------------------- */
 #define PB_ST_IDLE          (0u)

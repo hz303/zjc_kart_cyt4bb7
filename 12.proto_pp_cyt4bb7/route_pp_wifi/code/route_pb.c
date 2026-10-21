@@ -61,6 +61,23 @@ static uint8   s_drv   = PROTO_SRC_NONE;/* ★ 启动本轮回放的驱动令牌
                                               遥控抢走后若继续 renew，回放会跟着遥控跑。 */
 static float   s_vlim[INS_ROUTE_MAX_POINTS];    /* 每点限速 m/s（2048 × 4 B = 8 KB）*/
 
+/* ★★ 2026-10-21 起点基准（见 pb_start）：**起跑那一刻的 odom 快照**。
+   之后所有位姿都用"相对它"的增量算：px = p[0] + R(-s_o0yaw)·(o − o0)。
+   ⚠ 表头的 origin_x/y/yaw 不参与换算（它是"录制那一刻的 odom"，烧录/断电/抱车都会失真），
+     只拿来打一行诊断。这样"烧完再录、录完再烧、中间把车挪走"都不影响表。 */
+static float   s_o0x = 0.0f, s_o0y = 0.0f, s_o0yaw = 0.0f;
+/* ★ 2026-10-21：PWR 期间是否由**本模块**拿了本地授权（见 poll 的速度分支）。
+   为什么要拿：`spd_safety` 在 local=0 时会检查 1)上位机说过话 2)使能位(bit1+bit2)，
+   而"改 Follow"这条路根本不会发 SET_ENABLE ⇒ SAFE_BIT_NOT_EN 一直在 ⇒
+   spd_target 写得再对，电机也不出力 —— 现场就是"PWR 电机根本不转"。
+   遥控 ON 时是遥控自己 set_local(1)，回放这条路上没人做这件事。 */
+static uint8   s_local = 0u;
+/* ★ 当前进度点是否在**倒车段**（录制速度 < -PB_REV_EPS，带滞回）。
+   倒车时不能开航向外环：Pure Pursuit 的负反馈是对车头的，对车尾是正反馈 ⇒ 打圈。 */
+static uint8   s_rev = 0u;
+/* 急停连续计数（去抖用，见 poll 里的急停门） */
+static uint16  s_estop_ticks = 0u;
+
 /*===================================================================================================================
  *  一、工具
  *=================================================================================================================*/
@@ -106,45 +123,88 @@ static void pb_build_profile (uint16 n)
     if (win > 20) { win = 20; }
     if (vmin > vmax) { vmin = vmax; }
 
-    /* ---- ① 曲率限速 ---- */
+    /* ---- ① 曲率限速（倒车段不参与）----
+       ⚠ 2026-10-21 照 Polaris 的 build_profile 改了三处：
+         a) 窗口里的"弧长"要**逐段累加弦长**，不能用两端点直线距离：弯道上弦长 < 弧长，
+            会把 κ 算大、把弯里速度压得过低；
+         b) `arc ≈ 0` 有两种成因、处理相反：原地打方向 ⇒ 最急，给 vmin；
+            原地没动也没转（静止重复采样）⇒ 曲率无信息，给 vmax。
+            以前一律当 κ=0 给 vmax，等于"原地满舵再全油门"；
+         c) 录制速度 < 0 的点是**倒车段**：几何限速（横向抓地）对倒车没意义，
+            直接照抄录制速度，并作为反向传播的屏障（见 ②）。 */
     for (i = 0u; i < n; i ++)
     {
-        uint16 i0 = ((int)i - win > 0) ? (uint16)((int)i - win) : 0u;
-        uint16 i1 = ((int)i + win < (int)n - 1) ? (uint16)((int)i + win) : (uint16)(n - 1u);
-        float  arc = pb_dist(&p[i0], &p[i1]);
-        float  dyaw;
-        float  kap;
+        float  rec = p[i].v;
+        uint16 i0, i1, k;
+        float  arc = 0.0f;
+        float  dyaw_abs;
         float  v;
 
-        /* 曲率 = 航向差 / 弧长，**中心差分**。
-           ⚠ 窗口不能太小：航向量化 ÷ 短弧长 = 大曲率噪声 ⇒ 直道上冒"假弯"、
-             速度被莫名其妙压下去（Polaris 写 8 点就是这个原因）。 */
-        dyaw = pb_wrap180(p[i1].yaw - p[i0].yaw) * PB_D2R;
-        kap  = (arc > 1e-3f) ? fabsf(dyaw) / arc : 0.0f;
+        if (rec < -(float)PB_REV_EPS)
+        {
+            s_vlim[i] = rec;
+            continue;
+        }
 
-        v = (kap > 1e-4f) ? sqrtf(alat / kap) : vmax;
+        i0 = ((int)i - win > 0) ? (uint16)((int)i - win) : 0u;
+        i1 = ((int)i + win < (int)n - 1) ? (uint16)((int)i + win) : (uint16)(n - 1u);
+
+        for (k = i0; k < i1; k ++) { arc += pb_dist(&p[k], &p[k + 1u]); }
+
+        dyaw_abs = fabsf(pb_wrap180(p[i1].yaw - p[i0].yaw) * PB_D2R);
+
+        if (arc < 0.02f)
+        {
+            /* 0.017 rad ≈ 1°：转过角度 ⇒ 原地打方向（最急）；没转 ⇒ 静止段 */
+            v = (dyaw_abs > 0.017f) ? vmin : vmax;
+        }
+        else
+        {
+            float kap = dyaw_abs / arc;
+
+            v = (kap < 1e-3f) ? vmax : sqrtf(alat / kap);
+        }
+
         if (v > vmax) { v = vmax; }
         if (v < vmin) { v = vmin; }
         s_vlim[i] = v;
     }
 
-    /* ---- ② 反向传刹车：弯心的低速往前传 ⇒ 入弯前就减到位 ---- */
+    /* ---- ①b 换向点前爬行（Polaris ②b）----
+       车不可能不经过零速就从前进变倒车。换向点**前**那点留一点速度：慢了冲过头可忽略，
+       又保证进度点能越过换向点（钉死 0 会卡在那儿，永远换不过去）。 */
+    for (i = 1u; i < n; i ++)
+    {
+        if ((s_vlim[i] < 0.0f) && (s_vlim[i - 1u] > 0.0f)) { s_vlim[i - 1u] = (float)PB_REV_CREEP; }
+    }
+
+    /* ---- ② 反向传刹车：弯心低速往前传 ⇒ 入弯前就减到位 ----
+       ⚠ 换向点两侧**不互传**：倒车段的负速和前进段的正速不是同一条刹车链，
+          不跳过的话 lim 会算成负数，把前进段整段压死。 */
     for (i = (uint16)(n - 1u); i > 0u; i --)
     {
-        float ds  = pb_dist(&p[i - 1u], &p[i]);
-        float lim = sqrtf(s_vlim[i] * s_vlim[i] + 2.0f * abrk * ds);
+        float ds;
+        float lim;
 
+        if ((s_vlim[i] < 0.0f) || (s_vlim[i - 1u] < 0.0f)) { continue; }
+
+        ds  = pb_dist(&p[i - 1u], &p[i]);
+        lim = sqrtf(s_vlim[i] * s_vlim[i] + 2.0f * abrk * ds);
         if (s_vlim[i - 1u] > lim) { s_vlim[i - 1u] = lim; }
     }
 
-    /* ---- ③ 反向传完再抬一次地板（上一步会把直道端点压到 vmin 以下）---- */
+    /* ---- ③ 再抬一次地板（上一步会把直道端点压到 vmin 以下）----
+       ⚠ 只作用于**前进段**：倒车段是照抄的负速，抬地板会抹成正的。 */
     for (i = 0u; i < n; i ++)
     {
-        if (s_vlim[i] < vmin) { s_vlim[i] = vmin; }
+        if ((s_vlim[i] >= 0.0f) && (s_vlim[i] < vmin)) { s_vlim[i] = vmin; }
     }
 
-    /* ---- ④ 末段收油：最后 PB_END_SLOW_M 米线性降到 0 ----
-       ⚠ 必须在**差速分配之前**把 v 缩掉，否则两侧同比例缩放、平均速度不降。 */
+    /* ---- ④ 末段收油：最后 PB_END_SLOW_M 米线性降到 **vmin** ----
+       ⚠ 与 Polaris 的**有意差异**：Polaris 把最后一点锚 0，靠 pb_fin(0.15 m) 圈收车；
+          我们收到 0 会死锁（停在圈外、目标恒 0、判据永不触发），所以收到 vmin。
+       ⚠ 必须在差速分配之前缩掉，否则两侧同比例缩放、平均速度不降。
+       ⚠ 倒车段跳过（负速是照抄的，不能被缩放）。 */
     {
         const ins_wp_t *q = ins_route_get_points();
         float back = 0.0f;
@@ -154,12 +214,12 @@ static void pb_build_profile (uint16 n)
         {
             if (back < PB_END_SLOW_M)
             {
-                /* ★ 收到 **vmin**，不是 0。
-                   ⚠ 收到 0 会死锁：车停在终点圈外 0.2 m、速度目标恒 0 ⇒ 永远进不了
-                     `pb_fin` 判据 ⇒ `pb_en` 一直是 1，车趴在原地不动、也不报错。 */
-                float r = 1.0f - (back / PB_END_SLOW_M);
+                if (s_vlim[k] >= 0.0f)
+                {
+                    float r = 1.0f - (back / PB_END_SLOW_M);
 
-                s_vlim[k] = vmin + (s_vlim[k] - vmin) * r;
+                    s_vlim[k] = vmin + (s_vlim[k] - vmin) * r;
+                }
             }
             back += pb_dist(&q[k - 1u], &q[k]);
         }
@@ -236,7 +296,12 @@ static void pb_release_steer (void)
         steer_ctrl_set_head_enable(0u);
         s_head = 0u;
     }
-    steer_ctrl_set_target_delta(steer_ctrl_get_meas_delta());
+    /* ★★ 2026-10-21：退出时目标回 **0（回中）**，不再对齐实测角。
+       原因（现场）：PUSH 下被中止时方向盘正打在 27°，对齐实测角等于**把满舵保持住**，
+       人一推车就原地绕圈（18:05 那次转了 1.2 圈、yaw -454°）。
+       回中的代价是"退出那一刻内环走回正"（最多 27° 行程，SLEW 限速下约 0.2 s），
+       比"锁死在满舵"好得多；RC 接管时遥控本来就会自己写目标，不受影响。 */
+    steer_ctrl_set_target_delta(0.0f);
 }
 
 static void pb_finish (uint8 st, const char *why)
@@ -253,6 +318,18 @@ static void pb_finish (uint8 st, const char *why)
 
         pb_release_steer();
         spd_ctrl_set_coast(0u);         /* ★ 退出时务必撤自由轮，否则遥控/跑班也推不动 */
+
+        /* ★ 交还本地授权（只在**是我们拿的**、且遥控没有同时在驱动时才真的撤）。
+           不撤的后果：退出后安全门的 1/2/3 一直跳着，上位机看到的 `safety` 位图是假的；
+           乱撤的后果：遥控刚 set_local(1) 就被我们清掉 ⇒ 那 5 ms 里电机被门挡一下。 */
+        if (0u != s_local)
+        {
+            s_local = 0u;
+            if ((RC_ENGAGE_ON != RC_Engage) && (RC_ENGAGE_STANDBY != RC_Engage))
+            {
+                spd_safety_set_local(0u);
+            }
+        }
         if (pb_mode >= 1.5f)
         {
             spd_target_l = 0.0f;
@@ -270,9 +347,7 @@ static uint8 pb_start (void)
     const ins_wp_t *p;
     const ins_route_head_t *h;
     ins_odom_snap_t o;
-    float y0, dx, dy, px, py;
-    float best_d = 1e9f;
-    uint16 n, i, best = 0u;
+    uint16 n;
 
     n = ins_route_get_count();
     if (n < (uint16)PB_MIN_POINTS)  { printf("[PB] 表太短（%u 点）\r\n", (unsigned)n); pb_set_why("no table"); return 0u; }
@@ -283,37 +358,55 @@ static uint8 pb_start (void)
 
     ins_odom_snapshot(&o);
 
-    /* 车当前位姿 → 路表坐标系（录制起点车体系）*/
-    y0 = h->origin_yaw * PB_D2R;
-    dx = o.x - h->origin_x;
-    dy = o.y - h->origin_y;
-    px =  dx * cosf(y0) + dy * sinf(y0);
-    py = -dx * sinf(y0) + dy * cosf(y0);
+    /* ---- ★★ 起点对齐（2026-10-21 定稿）----
+       表的 x/y/yaw 是**相对录制起点**的（车体系），这部分与 odom 无关，永远有效；
+       会烂掉的是表头那三行 `origin_x/y/yaw` —— 它们是"录制那一刻的 odom"。
+       odom 是**上电以来的积分量**：烧一次录、断一次电就归零；把车抱起来走一段，
+       轮子不转、odom 也不动。把它当锚点，表就只能在"同一上电周期 + 没人动过车"时用。
 
-    /* 起跑做一次**全局**最近点搜索（之后只用单调窗口） */
-    for (i = 0u; i < n; i ++)
+       ⇒ 这里**一个绝对量都不用**：只把"现在的位姿"记成基准 (s_o0*)，
+          于是当前点 ≡ 表的第 0 点、当前朝向 ≡ p[0].yaw，之后全部用**增量**换算。
+          语义唯一且可复现：**把车摆到起点、大致朝对方向，再开 Follow。**
+          （录完立刻跑也成立：录制起点本来就是第 0 点，车这时也在那儿。） */
     {
-        float ex = px - p[i].x;
-        float ey = py - p[i].y;
-        float d  = ex * ex + ey * ey;
+        float c0 = cosf(h->origin_yaw * PB_D2R);
+        float s0 = sinf(h->origin_yaw * PB_D2R);
+        float ex = ( (o.x - h->origin_x) * c0 + (o.y - h->origin_y) * s0 - p[0].x);
+        float ey = (-(o.x - h->origin_x) * s0 + (o.y - h->origin_y) * c0 - p[0].y);
+        float d0 = sqrtf(ex * ex + ey * ey);
+        float dyaw = pb_wrap180(o.yaw - h->origin_yaw - p[0].yaw);
 
-        if (d < best_d) { best_d = d; best = i; }
+        s_o0x   = o.x;
+        s_o0y   = o.y;
+        s_o0yaw = o.yaw;
+
+        /* ⚠ 不用 %f：IAR 默认库不一定带浮点格式化 */
+        printf("[PB] 对齐: START (表头 origin 差 %u cm / %d deg%s)\r\n",
+               (unsigned)(d0 * 100.0f), (int)dyaw,
+               ((d0 > (float)PB_ALIGN_MAX_M) ? ", odom 换过/车被挪过 ⇒ 已忽略" : ""));
+
     }
 
-    s_idx  = best;
+    /* ---- ★★ 起始进度点（2026-10-21，照 Polaris playback_start_common）----
+       固定从第 3 点起步：对齐之后车本来就落在 p[0]，全局搜索必然返回 0；而第 0/1 点在
+       录制时是"静止起步段"（v≈0、位置几乎不动），拿它当进度点会让目标速度贴 0，
+       车要么不动、要么一松刹车猛一下。Polaris 用的就是 `n>3 ? 3 : 0`。
+       点数太少（n<=3）就退回 0，短表靠完成判据收尾。 */
+    s_idx  = (n > 3u) ? 3u : 0u;
+    s_rev  = 0u;
+    s_estop_ticks = 0u;
     s_n    = n;
     s_elat = 0.0f;
     s_ld   = 0.0f;
     s_tv   = 0.0f;
-    s_aim  = best;
+    s_aim  = s_idx;
 
     pb_build_profile(n);
 
     /* 刻意不用 %f：IAR 默认库不一定带浮点格式化 */
-    printf("[PB] 起跑: 槽 %u, %u 点, 最近点 #%u (距 %u mm), 巡航 %u cm/s, 打角 %u 点\r\n",
-           (unsigned)ins_route_slot_active(), (unsigned)n, (unsigned)best,
-           (unsigned)(sqrtf(best_d) * 1000.0f), (unsigned)(pb_vmax * 100.0f),
-           (unsigned)ins_route_steer_count());
+    printf("[PB] 起跑: 槽 %u, %u 点, 起步点 #%u, 巡航 %u cm/s, 打角 %u 点\r\n",
+           (unsigned)ins_route_slot_active(), (unsigned)n, (unsigned)s_idx,
+           (unsigned)(pb_vmax * 100.0f), (unsigned)ins_route_steer_count());
 
     if ((pb_ff_en >= 0.5f) && (0u == ins_route_steer_count()))
     {
@@ -325,8 +418,13 @@ static uint8 pb_start (void)
     s_drv = proto_drv_owner();
     if (PROTO_SRC_NONE == s_drv)
     {
-        printf("[PB] 没有驱动令牌（pb_en 不是经协议层写的？）\r\n");
-        return 0u;
+        /* ★ 2026-10-21：**没有令牌 ≠ 不能跑**。pb_en 也可能是"放行路径"给的
+           （内部调用 / 菜单刚写完而 proto_tick 恰好把过期租期收走）。
+           原来这里直接 return 0 ⇒ pb_en 停在 1 但 s_st 没进 RUN
+           ⇒ 屏幕写着 PUSH、车纹丝不动，现场只会当成"按键坏了"。
+           现在记 INTERNAL 继续跑（PUSH 本来就不给后轮力，风险很小）。 */
+        s_drv = PROTO_SRC_INTERNAL;
+        printf("[PB] 起跑时没有令牌持有者，按 INTERNAL 记账\r\n");
     }
 
     return 1u;
@@ -346,6 +444,7 @@ void route_pb_init (void)
     s_tv   = 0.0f;
     s_head = 0u;
     s_drv  = PROTO_SRC_NONE;
+    s_local = 0u;
     pb_en  = 0.0f;
     /* ⚠ 不要在这里清 pb_ff_en / pb_ff_gain：本函数在 app_param_init() **之后**调，
        清掉就等于把 Flash 里存的参数抹了。 */
@@ -354,9 +453,8 @@ void route_pb_init (void)
 void route_pb_poll (void)
 {
     const ins_wp_t *p;
-    const ins_route_head_t *h;
     ins_odom_snap_t o;
-    float  y0, dx, dy, px, py, pyaw;
+    float  px, py, pyaw;
     float  vabs, ld, elat;
     float  tx, ty, tyaw;
     float  dxr, dyr, pr, bx, by, alpha;
@@ -367,7 +465,7 @@ void route_pb_poll (void)
     {
         /* 航向测试（App 的测试页）优先：它也在写 target_yaw / spd_target_*，
            两边同时跑就是"两个源抢同一个执行器"。让位方必须是回放 —— 测试是人手按下的短时实验。 */
-        if (PB_ST_RUN == s_st) { pb_finish(PB_ST_IDLE, "航向测试占用"); }
+        if (PB_ST_RUN == s_st) { pb_finish(PB_ST_IDLE, "head test busy"); }
         s_arm = 0u;
         return;
     }
@@ -388,8 +486,15 @@ void route_pb_poll (void)
         ((RC_ENGAGE_FAILSAFE == RC_Engage) && (pb_mode >= 1.5f)))
     {
         if (PB_ST_RUN == s_st) { pb_finish(PB_ST_IDLE, "RC ON/ESTOP"); }
-        if (RC_ENGAGE_ESTOP == RC_Engage) { pb_set_why("RC ESTOP"); }
-        else if (RC_ENGAGE_ON == RC_Engage) { pb_set_why("RC ON"); }
+        /* ★ 2026-10-21：**每一次都写原因**，并且把"怎么解除"写在字串里。
+           现场最常卡的两条：
+             · RC ON          —— CH6 还合着，回放必须让位（这是设计，不是 bug）
+             · RC lost: PWR   —— 接收机没插/没开，`RC_Engage` **恒为 FAILSAFE**，
+                                 PWR 被安全门挡死（PUSH 不受影响）⇒ 屏幕上必须看得见，
+                                 否则就是"切 PWR 电机根本不转"却一点线索都没有。 */
+        if (RC_ENGAGE_ESTOP == RC_Engage)      { pb_set_why("ESTOP latch"); }
+        else if (RC_ENGAGE_ON == RC_Engage)    { pb_set_why("RC ON: CH6->OFF"); }
+        else                                   { pb_set_why("RC lost: PWR blk"); }
         s_arm = 0u;
         return;
     }
@@ -397,13 +502,25 @@ void route_pb_poll (void)
        否则急停期间本模块还在往 spd_target_* 写速度，解除急停那一拍车会直接窜出去。 */
     if (0u != spd_safety_estop())
     {
-        if (PB_ST_RUN == s_st) { pb_finish(PB_ST_ABORT, "急停"); pb_en = 0.0f; }
-        s_arm = 0u;
-        return;
+        /* ★★ 2026-10-21 去抖：`spd_safety` 的硬停机是**当拍**生效的（不等这里），
+           所以"回放要不要中止"完全可以慢 20 ms 再判。
+           18:05 那份日志里 CH5 只跳了**一帧**（20 ms）就把整趟废了、pb_en 清 0，
+           而且退出时方向盘还锁在满舵 —— 一个坏帧的代价太大了。 */
+        if (s_estop_ticks < (uint16)PB_ESTOP_TICKS) { s_estop_ticks ++; }
+        if (s_estop_ticks >= (uint16)PB_ESTOP_TICKS)
+        {
+            if (PB_ST_RUN == s_st) { pb_finish(PB_ST_ABORT, "ESTOP"); pb_en = 0.0f; }
+            s_arm = 0u;
+            return;
+        }
+    }
+    else
+    {
+        s_estop_ticks = 0u;
     }
     if (ins_odom_enable < 0.5f)
     {
-        if (PB_ST_RUN == s_st) { pb_finish(PB_ST_IDLE, "航位推算关闭"); }
+        if (PB_ST_RUN == s_st) { pb_finish(PB_ST_IDLE, "odom off"); }
         s_arm = 0u;
         return;
     }
@@ -427,8 +544,12 @@ void route_pb_poll (void)
             s_st  = PB_ST_ABORT;
             return;
         }
-        s_st = PB_ST_RUN;
+            s_st = PB_ST_RUN;
         pb_set_why("");
+
+        /* ★ 外环目标先落在"当前航向"上（Polaris 同款）：不然发车那一拍用的是上一次
+           回放留下的 target_yaw，方向盘会先甩一下。 */
+        steer_ctrl_set_target_yaw(o.yaw);
     }
     if (PB_ST_RUN != s_st) { return; }
 
@@ -439,24 +560,29 @@ void route_pb_poll (void)
          两边打架，而人看不出是谁在下命令。 */
     if (proto_drv_owner() != s_drv)
     {
-        pb_finish(PB_ST_ABORT, "驱动权被抢占");
+        pb_finish(PB_ST_ABORT, "drv preempted");
         pb_en = 0.0f;                       /* 释放命令：否则下一拍会"原地重新起跑" */
         s_arm = 0u;
         return;
     }
     proto_drv_renew(s_drv);
 
-    /* ---- 2) 当前位姿（路表系）---- */
+    /* ---- 2) 当前位姿（路表系，**只用相对量**）----
+       与 pb_start 同一套基准：px = p[0] + R(-s_o0yaw)·(o − o0)，pyaw 同理。
+       ⚠ 别把这里改回 `o.x - h->origin_x`：那等于又绑回"录制那一刻的 odom"，
+         烧录/断电/抱车之后就会算到几十米外（17:25 那次满舵左就是这么来的）。 */
     p = ins_route_get_points();
-    h = ins_route_get_head();
     ins_odom_snapshot(&o);
+    {
+        float dx0 = o.x - s_o0x;
+        float dy0 = o.y - s_o0y;
+        float c   = cosf(s_o0yaw * PB_D2R);
+        float sn  = sinf(s_o0yaw * PB_D2R);
 
-    y0 = h->origin_yaw * PB_D2R;
-    dx = o.x - h->origin_x;
-    dy = o.y - h->origin_y;
-    px   =  dx * cosf(y0) + dy * sinf(y0);
-    py   = -dx * sinf(y0) + dy * cosf(y0);
-    pyaw = o.yaw - h->origin_yaw;
+        px   = p[0].x + ( dx0 * c + dy0 * sn);
+        py   = p[0].y + (-dx0 * sn + dy0 * c);
+        pyaw = pb_wrap180(p[0].yaw + (o.yaw - s_o0yaw));
+    }
 
     /* ---- 3) 最近点（单调）---- */
     best  = pb_find_nearest(px, py, p);
@@ -472,15 +598,20 @@ void route_pb_poll (void)
         float ly = py - p[s_n - 1u].y;
         float ld2 = sqrtf(lx * lx + ly * ly);
 
+        /* ★ 2026-10-21 回到 Polaris 的原始判据：**只按距离**（kart_playback_poll 里
+           就是 `if(last_dist < FINISH_DIST) complete`），先前我自己加的"必须走过一半"
+           已经撤掉 —— 那是为了绕开"8 字起点≈终点"，但真正的保护是：
+           ① 起始进度点从第 3 点起（不是 0）；② 距离圈只有 pb_fin(0.15 m)；
+           ③ 进度索引单调，只前进不后退。加"过半"反而会让半圈表永远收不了车。 */
         if (ld2 < ((pb_fin > 0.02f) ? pb_fin : 0.02f))
         {
-            pb_finish(PB_ST_DONE, "到终点圈");
+            pb_finish(PB_ST_DONE, "done: finish");
             pb_en = 0.0f;
             return;
         }
         if (best >= (uint16)(s_n - 1u))
         {
-            pb_finish(PB_ST_ABORT, "索引到末点但离终点很远");
+            pb_finish(PB_ST_ABORT, "end idx, far off");
             pb_en = 0.0f;
             return;
         }
@@ -500,8 +631,12 @@ void route_pb_poll (void)
         float v = s_vlim[best];
         float mpr;
 
+        /* ⚠ 2026-10-21：下界原来写死 0 ⇒ **倒车段的正负一进来就被夹成 0**，
+           于是"倒车段开环打角"只是把方向盘打过去、车一步都不退。
+           剖面里倒车点是照抄的负速（Polaris 同款），这里必须让负值过去，
+           只是别超过 pb_vmax（反方向同样的速度上限）。 */
         if (v >  pb_vmax) { v =  pb_vmax; }
-        if (v <  0.0f)    { v =  0.0f;    }
+        if (v < -pb_vmax) { v = -pb_vmax; }
         s_tv = v;
 
         if (pb_mode < 1.5f)
@@ -522,6 +657,17 @@ void route_pb_poll (void)
             float vl, vr;
 
             spd_ctrl_set_coast(0u);         /* 带速度跟随：先撤自由轮，再给目标 */
+
+            /* ★ 拿本地授权（2026-10-21）。谁在驱动谁拿：遥控 ON 时遥控拿，
+               PWR 时就是本模块拿 —— 否则 SAFE_BIT_NOT_EN 一直挂着，电机不出力。
+               ⚠ 只在**第一次**拿，避免每 5 ms 打日志；释放见 pb_finish。 */
+            if (0u == s_local)
+            {
+                spd_safety_set_local(1u);
+                s_local = 1u;
+                printf("[PB] PWR: 取本地授权（安全门 1/2/3 换成 LOCAL）\r\n");
+            }
+
             mpr = (ins_m_per_rev > 1e-4f) ? ins_m_per_rev : 0.8193f;
 
             /* ---- 6b) 电子差速（2026-10-17）----
@@ -548,11 +694,58 @@ void route_pb_poll (void)
     if (ld < 0.05f) { ld = 0.05f; }
     s_ld = ld;
 
-    /* ---- 8) 沿弧长找前视点 ---- */
+    /* ---- 8) 倒车段判定（Polaris 方案B）----
+       Pure Pursuit 的航向外环是"车头"的负反馈；倒车时车尾才是被控端，同一套符号
+       会变成**正反馈** ⇒ 越跟越偏、原地打圈。所以倒车段：关外环、只开转角内环、
+       开环回放录制那一拍的打角。
+       判据用**录制速度**（p[best].v），不是剖面速度：剖面在换向前会被压到接近 0，
+       拿它判段会在换向点附近来回翻。
+       带死区滞回（PB_REV_EPS），防边界反复翻使能位。 */
+    {
+        float recv = p[best].v;
+
+        if (recv >  (float)PB_REV_EPS)      { s_rev = 0u; }
+        else if (recv < -(float)PB_REV_EPS) { s_rev = 1u; }
+    }
+
+    if (0u != s_rev)
+    {
+        float delta = (float)p[best].steer_cdeg / 100.0f;      /* 录制那一拍实际施加的角 */
+        float err   = pb_wrap180(p[best].yaw - pyaw);           /* 表系里的航向误差 */
+        float corr  = (float)PB_REV_HEAD_KP * err;
+
+        /* ⚠ PB_REV_HEAD_KP 默认 0 = 纯开环。Polaris 用 20 计数/度（≈1.5 deg/deg）做纠偏，
+           因为它的倒车段有好几米、漂 11°；我们这张表倒车只有 7 点 ≈ 0.7 m，先不开。
+           真要开，先确认符号：反了就是正反馈（越纠越斜）。 */
+        delta += corr;
+        if (delta >  27.0f) { delta =  27.0f; }
+        if (delta < -27.0f) { delta = -27.0f; }
+
+        if (0u != s_head)
+        {
+            steer_ctrl_set_head_enable(0u);     /* 关掉前进用航向外环 */
+            s_head = 0u;
+        }
+        steer_ctrl_set_target_delta(delta);     /* 只走内环 */
+
+        s_ytgt = pb_wrap180(o.yaw + err);       /* 仅给遥测/调试看 */
+        s_aim  = best;
+
+        /* 速度已经在第 6 步按 s_vlim[best] 下发了（倒车段那里是照抄的负值） */
+        return;
+    }
+    else if (0u == s_head)
+    {
+        /* 从倒车段回到前进段：把外环重新打开（9a 里也会开，这里只是早点，避免一拍滞后） */
+        steer_ctrl_set_head_enable(1u);
+        s_head = 1u;
+    }
+
+    /* ---- 9) 沿弧长找前视点 ---- */
     s_aim = pb_find_lookahead(best, p, ld);
     j     = s_aim;
 
-    /* ---- 9) 转向：两条通道（数学等价，留两条做 A/B）----
+    /* ---- 10) 转向：两条通道（数学等价，留两条做 A/B）----
        车体系：x 向右 / y 向前；alpha 正 = 目标点在右；
        `steer_delta > 0` = 右转（已实测），`yaw` 正 = 左转。
        ⇒ 前视点在世界系的**目标航向** = 当前航向 − alpha。 */

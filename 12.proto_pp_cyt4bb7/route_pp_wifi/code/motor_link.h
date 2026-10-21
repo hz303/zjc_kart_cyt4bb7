@@ -70,7 +70,7 @@ extern volatile float   spd_tel_period;     /* 遥测周期 ms(5~200)           
  *  ⚠ 档 1 若那台 PC 的 IP 是 DHCP 拿的会变，可把 MOTOR_HOST_IP 改成该网段广播
  *    （如 192.168.50.255），这样 PC 端 KartHost 照样能收，且不怕 IP 变。
  *=================================================================================================================*/
-#define MOTOR_NET_PROFILE       (1)                     /* ★ 0 = 手机热点 / 1 = 实验室 IoT 网  */
+#define MOTOR_NET_PROFILE       (0)                     /* ★ 0 = 手机热点 / 1 = 实验室 IoT 网  */
 
 #if   (MOTOR_NET_PROFILE == 0)
   #define MOTOR_WIFI_SSID       "XIOQ-3695"             /* 手机热点名                          */

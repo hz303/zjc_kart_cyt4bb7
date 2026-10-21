@@ -117,9 +117,28 @@ static const um_item_t UM_ITEMS[] =
 /* ---- 第 7 项的取值范围（**rps 口径**）------------------------------------------------
  *  用户口径是 rps，而 pb_vmax 在车端是 m/s ⇒ 菜单这边换算，参数表不动。
  *  ⚠ 换轮子重标 ins_mpm 后这里自动跟随（系数取自 ins_m_per_rev）。 */
-#define UM_RPS_MIN      (0.8f)
-#define UM_RPS_MAX      (3.0f)
-#define UM_RPS_STEP     (0.1f)
+/* ★ 2026-10-21：0.8~3.0 连续可调 → **3 档基准速度**（用户口径 rps）。
+   现场只有"慢 / 中 / 快"三档要选；连续 0.1 步长在 4 键屏上要按十几次，
+   还容易停在 1.199999 这种数上。档位表就在这里，改档 = 查表。 */
+static const float UM_PWR_GEAR[] = { 0.8f, 1.2f, 2.4f };
+#define UM_PWR_NGEAR    ((uint8)(sizeof(UM_PWR_GEAR) / sizeof(UM_PWR_GEAR[0])))
+
+/* 把一个 rps 值吸到最近的档位（参数被 App/上位机改成别的值时也不会显示成怪数） */
+static uint8 um_gear_of (float rps)
+{
+    uint8 g;
+    uint8 best = 0u;
+    float bd   = 1.0e9f;
+
+    for (g = 0u; g < UM_PWR_NGEAR; g ++)
+    {
+        float d = rps - UM_PWR_GEAR[g];
+
+        if (d < 0.0f) { d = -d; }
+        if (d < bd) { bd = d; best = g; }
+    }
+    return best;
+}
 
 /* 提示行（列表标题右侧那一行）。放在这里是因为 um_write() 也要往它里面写"拒跑原因"。 */
 static char   s_msg[24] = "";
@@ -178,14 +197,16 @@ static uint8 um_read(uint8 idx, float *v, float *lo, float *hi, float *st)
             *st = 1.0f;
             return 1u;
 
-        case UM_RPS:                        /* 显示 rps，存 m/s */
+        case UM_RPS:                        /* 显示 rps（3 档吸附），存 m/s */
         {
             float mpr = (ins_m_per_rev > 1e-4f) ? ins_m_per_rev : 0.8193f;
+            uint8 g   = um_gear_of(pb_vmax / mpr);
 
-            *v  = pb_vmax / mpr;
-            *lo = UM_RPS_MIN;
-            *hi = UM_RPS_MAX;
-            *st = UM_RPS_STEP;
+            *v  = UM_PWR_GEAR[g];
+            *lo = UM_PWR_GEAR[0];
+            *hi = UM_PWR_GEAR[UM_PWR_NGEAR - 1u];
+            /* st = 0 是给按键处理看的记号：**不是等差数列，别用 +=st 那套** */
+            *st = 0.0f;
             return 1u;
         }
 
@@ -200,6 +221,26 @@ static uint8 um_read(uint8 idx, float *v, float *lo, float *hi, float *st)
 #define UM_ID_PB_EN     (43u)
 #define UM_ID_PB_MODE   (44u)
 #define UM_ID_PB_VMAX   (45u)
+
+/* 令牌持有者 → 三个字母，屏幕那行只放得下这么点 */
+static const char * um_src_name (uint8 src)
+{
+    switch (src)
+    {
+        case PROTO_SRC_RC:       return "RC";
+        case PROTO_SRC_SPI:      return "PC";
+        case PROTO_SRC_MENU:     return "MENU";
+        case PROTO_SRC_INTERNAL: return "INT";
+        default:                 return "-";
+    }
+}
+
+/* "已使能但没跑起来"：pb_en=1 却 route_pb 不在 RUN（没表 / odom 关 / 起跑失败）。
+   不把它显示出来，现场只会看到屏幕写着 PUSH、车纹丝不动 —— 然后怀疑按键坏了。 */
+static uint8 um_pb_wait (void)
+{
+    return ((pb_en > 0.5f) && (0u == route_pb_active())) ? 1u : 0u;
+}
 
 /* ---- 统一写入口：菜单的每一次"改参数"都走协议层（权限 / 钳位 / 驱动令牌）----
  *  ⚠ 以前菜单是**直接写变量**的（`pb_en = 1`、`steer_ctrl_set_angle_enable(1)`）——
@@ -221,7 +262,12 @@ static uint8 um_set (uint8 id, float v)
 
     if (PROTO_OK != e)
     {
-        snprintf(s_msg, sizeof(s_msg), "REFUSE %s", proto_err_name(e));
+        /* ★ 2026-10-21：只给 busy 等于没说。现场必须一眼看出"是谁在开车"：
+             RC  = CH6 还合着（遥控就是驾驶员）⇒ 先把使能开关收回来再按
+             PC  = 上位机占着（它在续租）⇒ 先停掉上位机的目标写入
+             MENU= 自己（上一次写的租期还没走完，极少见） */
+        snprintf(s_msg, sizeof(s_msg), "REFUSE %s by %s",
+                 proto_err_name(e), um_src_name(proto_drv_owner()));
     }
     return e;
 }
@@ -263,6 +309,13 @@ static void um_write(uint8 idx, float v)
                        关掉跟随（OFF）时**不**撤销内环 —— 保持住当前位置比松手安全。 */
                     (void)um_set(UM_ID_STEER_EN, 1.0f);
                     (void)um_set(UM_ID_PB_EN, 1.0f);
+
+                    /* 使能写进去了，但回放可能起不来（没表 / odom 关 / 起跑失败）——
+                       当场把 route_pb 的原因贴出来，别让人以为"按键没反应"。 */
+                    if (0u != um_pb_wait())
+                    {
+                        snprintf(s_msg, sizeof(s_msg), "WAIT: %s", route_pb_reason());
+                    }
                 }
             }
             break;
@@ -442,6 +495,7 @@ static void um_value_text(uint8 idx, char *out, uint8 size)
     switch (UM_ITEMS[idx].kind)
     {
         case UM_MODE:
+            if (0u != um_pb_wait()) { snprintf(out, size, "WAIT"); break; }   /* 开了但没跑起来 */
             snprintf(out, size, "%s", (v < 0.5f) ? "OFF" : ((v > 1.5f) ? "PWR" : "PUSH"));
             break;
 
@@ -509,8 +563,17 @@ static void um_draw_edit(void)
     /* 第 6/7 项显示成人话，不加单位后缀也能看懂 */
     if (UM_MODE == it->kind)
     {
-        um_puts(3u, 0u, (v < 0.5f) ? "= OFF  (pb_en=0)"
-                     : ((v > 1.5f) ? "= PWR  (steer+speed)" : "= PUSH (steer only)"));
+        if (0u != um_pb_wait())
+        {
+            /* 已使能但没跑：把 route_pb 记下的原因直接贴出来（no table / odom off …） */
+            snprintf(line, sizeof(line), "= WAIT: %s", route_pb_reason());
+            um_puts(3u, 0u, line);
+        }
+        else
+        {
+            um_puts(3u, 0u, (v < 0.5f) ? "= OFF  (pb_en=0)"
+                         : ((v > 1.5f) ? "= PWR  (steer+speed)" : "= PUSH (steer only)"));
+        }
     }
     else if (UM_RPS == it->kind)
     {
@@ -535,9 +598,17 @@ static void um_draw_edit(void)
                  (unsigned)((pb_en > 0.5f) ? 1u : 0u), (unsigned)route_pb_state());
         um_puts(4u, 0u, line);
 
-        snprintf(line, sizeof(line), "coast=%u", (unsigned)spd_ctrl_coast());
+        /* ★ 2026-10-21：第 5 行给"跑到哪了"，比 coast 有用得多 ——
+           coast 永远是 0/1 两位信息，而 idx/n 和横向误差能一眼分出
+           "压根没起跑"（idx 不动）和"跑了但脱线"（idx 涨、e 很大）。 */
+        snprintf(line, sizeof(line), "i%u/%u e%d c%u",
+                 (unsigned)route_pb_index(), (unsigned)ins_route_get_count(),
+                 (int)(route_pb_elat() * 100.0f), (unsigned)spd_ctrl_coast());
         um_puts(5u, 0u, line);
 
+        /* ⚠ 这里只放 **ASCII**：屏幕字体没有中文，中文进 um_puts 就是乱码
+              （`%.18s` 还会从半个汉字处截断，屏幕上会糊成两行）。
+              所以 route_pb.c 的 pb_set_why() 也只用英文，见那里的注释。 */
         snprintf(line, sizeof(line), "%.18s", route_pb_reason());
         um_puts(6u, 0u, line);
     }
@@ -764,7 +835,17 @@ void ui_menu_task(void)
         float v = 0.0f, lo = 0.0f, hi = 0.0f, st = 0.0f;
         uint8 has = um_read(s_cur, &v, &lo, &hi, &st);
 
-        if ((0 != dir) && (0u != has))
+        if ((0 != dir) && (0u != has) && (UM_RPS == UM_ITEMS[s_cur].kind))
+        {
+            /* ★ 3 档循环：K3（-）= 慢一档、K4（+）= 快一档，首尾相接 */
+            uint8 g = um_gear_of(v);
+
+            g = (uint8)((dir > 0) ? ((g + 1u) % UM_PWR_NGEAR)
+                                  : ((g + (UM_PWR_NGEAR - 1u)) % UM_PWR_NGEAR));
+            um_write(s_cur, UM_PWR_GEAR[g]);
+            has = um_read(s_cur, &v, &lo, &hi, &st);
+        }
+        else if ((0 != dir) && (0u != has))
         {
             v += ((dir > 0) ? st : -st);
 
