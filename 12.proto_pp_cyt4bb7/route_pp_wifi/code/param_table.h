@@ -78,7 +78,7 @@
     X( 0, "target_l",   "目标|左轮转速",      -8.000f,    8.000f,    0.000f, "rps",   0.050f, &spd_target_l,        P_CMD,     G_SPD  ) \
     X( 1, "target_r",   "目标|右轮转速",      -8.000f,    8.000f,    0.000f, "rps",   0.050f, &spd_target_r,        P_CMD,     G_SPD  ) \
     X( 2, "duty_limit", "限幅|占空比上限",     0.000f,  100.000f, SPD_DUTY_DEFAULT,  "%",   1.000f, &spd_duty_limit_pct, P_RW_IDLE, G_SYS  ) \
-    X( 3, "target_max", "限幅|目标转速上限",   0.000f,   20.000f,    3.000f, "rps",   0.100f, &spd_target_max,      P_RW_IDLE, G_SYS  ) \
+    X( 3, "target_max", "限幅|目标转速上限",   0.000f,   20.000f,    3.500f, "rps",   0.100f, &spd_target_max,      P_RW_IDLE, G_SYS  ) /* 2026-10-22: 3.0 -> 3.5（后轮上限）*/ \
     X( 4, "k_v",        "增益|比例 k_v",       0.000f,    2.000f, SPD_K_V_DEFAULT,   "-",   0.005f, &spd_g.k_v,          P_RW_LIVE, G_SPD  ) \
     X( 5, "k_z",        "增益|积分 k_z",       0.000f,   20.000f, SPD_K_Z_DEFAULT,   "-",   0.050f, &spd_g.k_z,          P_RW_LIVE, G_SPD  ) \
     X( 6, "inv_K",      "前馈|1/K",            0.000f,    0.500f, SPD_INV_K_DEFAULT, "-",   0.001f, &spd_g.inv_K,        P_RW_LIVE, G_SPD  ) \
@@ -103,7 +103,7 @@
     X(25, "steer_slew", "转向|目标斜坡",       0.000f,  200.000f,   0.000f, "deg/s", 1.000f, &steer.slew_deg_s,    P_RW_LIVE, G_STEER) \
     X(26, "steer_lim",  "转向|软限位",         0.000f,   27.000f,  27.000f, "deg",   0.500f, &steer.limit_deg,     P_RW_IDLE, G_STEER) \
     X(27, "rc_arm_en",  "遥控|允许接管",       0.000f,    1.000f,   1.000f, "-",     1.000f, &rc_arm_en,           P_RW_LIVE, G_RC   ) \
-    X(28, "rc_thr_max", "遥控|满杆转速",       0.000f,   20.000f,   2.000f, "rps",   0.100f, &rc_thr_max,          P_RW_LIVE, G_RC   ) \
+    X(28, "rc_thr_max", "遥控|满杆转速",       0.000f,   20.000f,   3.500f, "rps",   0.100f, &rc_thr_max,          P_RW_LIVE, G_RC   ) /* 2026-10-22: 2.0 -> 3.5；不改它 target_max=3.5 在遥控下永远够不着 */ \
     X(29, "ol_en",      "标定|开环模式",       0.000f,    1.000f,   0.000f, "-",     1.000f, &spd_ol_en,           P_CMD,     G_SYS  ) \
     X(30, "ol_duty_l",  "标定|左轮开环duty", -100.000f,  100.000f,   0.000f, "%",     1.000f, &spd_ol_duty_l,       P_CMD,     G_SYS  ) \
     X(31, "ol_duty_r",  "标定|右轮开环duty", -100.000f,  100.000f,   0.000f, "%",     1.000f, &spd_ol_duty_r,       P_CMD,     G_SYS  ) \
@@ -114,7 +114,7 @@
     X(36, "ins_slip",   "惯导|打滑门限",        0.000f,  100.000f,  30.000f, "%",     1.000f, &ins_slip_pct,        P_RW_LIVE, G_INS  ) \
     X(37, "ins_zero",   "惯导|位姿归零(0>1)",   0.000f,    1.000f,   0.000f, "-",     1.000f, &ins_zero_cmd,        P_CMD,     G_INS  ) \
     X(38, "rt_rec",     "路表|录制(0>1开/1>0停)",0.000f,   1.000f,   0.000f, "-",     1.000f, &rt_rec_cmd,          P_RW_LIVE, G_RT   ) /* 2026-10-21: P_CMD -> P_RW_LIVE（录表不产生运动量，遥控合闸时也允许按）*/ \
-    X(39, "rt_ds",      "路表|采样点距",       0.050f,    0.150f,   0.050f, "m",     0.010f, &ins_route_ds,        P_RW_LIVE, G_RT   ) /* 2026-10-21: P_RW_IDLE -> P_RW_LIVE（手机录表时人正拿遥控开车，IDLE 会被令牌挡住；它只改采样阈值，不产生运动量。录制中改只影响之后的点）*/ \
+    X(39, "rt_ds",      "路表|采样点距",       0.050f,    0.150f,   0.100f, "m",     0.010f, &ins_route_ds,        P_RW_LIVE, G_RT   ) /* 2026-10-21: P_RW_IDLE -> P_RW_LIVE（手机录表时人正拿遥控开车，IDLE 会被令牌挡住；它只改采样阈值，不产生运动量。录制中改只影响之后的点）*/ \
     X(40, "rt_slot",    "路表|当前槽(0~4)",    0.000f,    4.000f,   0.000f, "-",     1.000f, &rt_slot_cmd,         P_CMD,     G_RT   ) \
     X(41, "rt_load",    "路表|重载槽(0>1)",    0.000f,    1.000f,   0.000f, "-",     1.000f, &rt_load_cmd,         P_CMD,     G_RT   ) \
     X(42, "rt_save",    "路表|存到槽(0>1)",    0.000f,    1.000f,   0.000f, "-",     1.000f, &rt_save_cmd,         P_CMD,     G_RT   ) \

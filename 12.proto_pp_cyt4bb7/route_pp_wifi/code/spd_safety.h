@@ -56,14 +56,18 @@
 #define SPD_HB_TIMEOUT_MS_PUB   (200u)      /* 主循环心跳超时(与 .c 里一致, 便于外部判读) */
 
 /* 占空比限幅(%): 硬顶 SPD_DUTY_HARD_MAX, 上电默认 SPD_DUTY_DEFAULT
- *   ⚠ 2026-10-18 默认 **30 → 60**（用户要求：跑锥桶/赛道要更大的牵引力）。
- *     60 恰好等于硬顶 ⇒ 上电后这道限幅**等于不生效**；要保守就现场把 duty_limit 拖回 30 再 ParmSve。
+ *   ⚠ 2026-10-18 默认 30 → 60；⚠ 2026-10-22 再 **60 → 80**（配合 target_max 3.5 rps）。
+ *     80 恰好等于硬顶 ⇒ 上电后这道限幅**等于不生效**；要保守就现场把 duty_limit 拖回 50 再 ParmSve。
+ *   ⚠⚠ **80% 不是"安全值"**：这是这颗板子上唯一的输出硬约束，热和电流都靠它兜。
+ *      按落地标定 `v[rps] = 0.069·(u% − 5.68)`，3.5 rps 只需要 **≈56%**；
+ *      80% 的余量是给"上坡/加速/带载"用的，**长时间顶到 80% 会热**（DRV8701E + 电机）。
+ *      温度或母线电流没底时，先把 duty_limit 压到 60~65 再试。
  *   ⚠ 这个宏是**唯一权威**，两处引用它：
  *       ① 本文件对应 .c 里 spd_duty_limit_pct 的初值
  *       ② motor_link.h 参数表 ID2 的默认值（点"恢复默认值"回落到这里，不会回 30）
  *     （踩过 k_z 的坑：同一个数在宏/参数表/上位机各写一个，点一次恢复默认行为就变了） */
-#define SPD_DUTY_HARD_MAX   (60.0f)
-#define SPD_DUTY_DEFAULT    (60.0f)
+#define SPD_DUTY_HARD_MAX   (80.0f)
+#define SPD_DUTY_DEFAULT    (80.0f)
 
 extern volatile float   spd_duty_limit_pct;     /* 占空比限幅 %(上位机可改)  */
 extern volatile float   spd_lost_ms;            /* 失联判定延时 ms           */
@@ -74,7 +78,14 @@ void    spd_safety_tick         (void);         /* 5ms: 更新保护状态(由 s
 void    spd_safety_heartbeat    (void);         /* 主循环每圈调一次                       */
 
 /* ★ 本地接管：1 = 换掉"上位机三道门"(1/2/3)，4)/5) 仍生效。见上面长注释。 */
-void    spd_safety_set_local    (uint8 on);
+/* ★★ 2026-10-21：本地授权改成**按来源 OR**（谁在驱动谁点灯）。
+   以前是一个 uint8：遥控每 5 ms 往 OFF/FAILSAFE 分支里写 0，会把回放刚点的灯灭掉
+   ⇒ PWR 永远过不了 SAFE_BIT_NOT_EN（"PUSH 正常、PWR 电机一动不动"的根因）。 */
+#define SPD_LOCAL_SRC_RC        (0x01u)     /* 遥控（ON / STANDBY 时点） */
+#define SPD_LOCAL_SRC_PB        (0x02u)     /* 路表回放 PWR */
+#define SPD_LOCAL_SRC_BENCH     (0x04u)     /* 保留：跑班（目前走遥控/上位机使能） */
+void    spd_safety_set_local_src(uint8 src, uint8 on);
+void    spd_safety_set_local    (uint8 on);      /* 兼容旧调用 = 只动"遥控"那一位 */
 uint8   spd_safety_local        (void);         /* 当前档位(回读, 诊断用)                 */
 
 /* ★★ 遥控急停（CH5）。**全局硬停机**，与"谁在开车"无关：

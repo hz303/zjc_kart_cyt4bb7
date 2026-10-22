@@ -325,10 +325,7 @@ static void pb_finish (uint8 st, const char *why)
         if (0u != s_local)
         {
             s_local = 0u;
-            if ((RC_ENGAGE_ON != RC_Engage) && (RC_ENGAGE_STANDBY != RC_Engage))
-            {
-                spd_safety_set_local(0u);
-            }
+            spd_safety_set_local_src(SPD_LOCAL_SRC_PB, 0u);   /* 只灭自己那一盏 */
         }
         if (pb_mode >= 1.5f)
         {
@@ -663,9 +660,14 @@ void route_pb_poll (void)
                ⚠ 只在**第一次**拿，避免每 5 ms 打日志；释放见 pb_finish。 */
             if (0u == s_local)
             {
-                spd_safety_set_local(1u);
+                /* ★★ 必须**按来源**点灯：遥控在 OFF/FAILSAFE 分支里每 5 ms 写一次
+                   `set_local(0)`，一把清零的写法会让这里 5 ms 就失效
+                   （PWR 电机不转的真因）。点完顺手打一行"到底出不出力"。 */
+                spd_safety_set_local_src(SPD_LOCAL_SRC_PB, 1u);
                 s_local = 1u;
-                printf("[PB] PWR: 取本地授权（安全门 1/2/3 换成 LOCAL）\r\n");
+                printf("[PB] PWR 授权: local=%u allow=%u flags=0x%04X (allow=0 就是出力被闸死)\r\n",
+                       (unsigned)spd_safety_local(), (unsigned)spd_safety_allow(0u),
+                       (unsigned)spd_safety_flags());
             }
 
             mpr = (ins_m_per_rev > 1e-4f) ? ins_m_per_rev : 0.8193f;

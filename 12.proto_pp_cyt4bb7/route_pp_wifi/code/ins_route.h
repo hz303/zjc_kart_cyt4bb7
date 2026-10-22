@@ -57,7 +57,7 @@
  *    ⚠ 采样**仍只按距离**（转角触发默认关）：等间距能让"沿弧长找点"退化成整数索引。
  *=================================================================================================================*/
 #define INS_ROUTE_MAX_POINTS    (INS_RT_SLOT_CAPACITY)      /* = 2048，见 Flash 多槽布局 */
-#define INS_ROUTE_DS_DEFAULT    (0.05f)         /* 米：默认点距 ⇒ 单槽 102 m           */
+#define INS_ROUTE_DS_DEFAULT    (0.10f)         /* 米：默认点距 ⇒ 单槽 102 m           */
 #define INS_ROUTE_DS_MIN        (0.02f)
 #define INS_ROUTE_DS_MAX        (0.20f)
 #define INS_ROUTE_YAW_THRESH    (2.0f)          /* 度：转弯触发阈值（**默认不启用**）*/

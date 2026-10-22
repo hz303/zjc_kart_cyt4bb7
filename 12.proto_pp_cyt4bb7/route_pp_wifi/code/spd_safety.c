@@ -17,7 +17,8 @@ static volatile uint32  s_trip_msg   = 0;       /* 新发生的事件(被主循�
 static volatile uint32  s_last_hb_ms = 0;       /* 上次主循环心跳时刻          */
 static volatile uint8   s_hb_seen    = 0;       /* 是否已经收到过心跳          */
 static uint32           s_cfg_bad    = 0;       /* 配置自检结果                */
-static volatile uint8   s_local      = 0;       /* ★ 本地接管档位(跳过上位机三道门) */
+static volatile uint8   s_local_mask = 0;   /* ★ 本地接管**按来源的位图**(跳过上位机三道门)
+                                               0x01 遥控 / 0x02 回放 PWR —— 见 spd_safety.h */
 static volatile uint8   s_estop      = 0;       /* ★ 遥控急停(全局硬停机, 替不掉)   */
 
 #define SPD_HB_TIMEOUT_MS   (200u)              /* 主循环心跳超时 */
@@ -51,7 +52,7 @@ void spd_safety_init (void)
     s_trip_msg   = 0;
     s_last_hb_ms = 0;
     s_hb_seen    = 0;
-    s_local      = 0;                       /* 上电默认【不】接管: 一律走完整五道门 */
+    s_local_mask = 0;                       /* 上电默认【不】接管: 一律走完整五道门 */
     s_cfg_bad    = spd_safety_cfg_check();
 
     if (0 != s_cfg_bad)
@@ -62,18 +63,29 @@ void spd_safety_init (void)
 
 /* ★ 本地接管档位。由主循环每圈按"当前有没有本地驱动源"推一次(见 remote_ctrl.c)。
    ⚠ 这里只换 1)/2)/3) 三道"上位机门"; 心跳与限幅不受它影响。 */
+/* ★★ 按来源点灯/灭灯：**谁都不能灭别人的灯**。
+   遥控每 5 ms 会往 OFF/FAILSAFE 分支写一次"我不开车了"；以前那是一把清零，
+   于是回放 PWR 拿到的授权 5 ms 就没了，`spd_safety_allow()` 一直判 NOT_EN
+   —— 这就是"PUSH 正常、PWR 电机一动不动"的根因。 */
+void spd_safety_set_local_src (uint8 src, uint8 on)
+{
+    if (0u != on) { s_local_mask = (uint8)(s_local_mask | src); }
+    else          { s_local_mask = (uint8)(s_local_mask & (uint8)(~src)); }
+}
+
+/* 兼容旧调用：只知道 on/off 的调用方一律记成"遥控"那一位 */
 void spd_safety_set_local (uint8 on)
 {
-    s_local = on ? 1 : 0;
+    spd_safety_set_local_src(SPD_LOCAL_SRC_RC, on);
 }
 
 uint8 spd_safety_local (void)
 {
-    return s_local;
+    return (0u != s_local_mask) ? 1u : 0u;
 }
 
 /* ★★ 遥控急停：全局硬停机。见 spd_safety.h / remote_ctrl.h。
-   ⚠ 与 s_local 的关系是**单向**的：estop=1 时无论 local 是什么都停机；
+   ⚠ 与 s_local_mask 的关系是**单向**的：estop=1 时无论 local 是什么都停机；
      local 只能替换"上位机三道门"，永远换不掉急停。 */
 void spd_safety_set_estop (uint8 on)
 {
@@ -108,7 +120,7 @@ void spd_safety_tick (void)
         f |= SAFE_BIT_ESTOP;
     }
 
-    if (0 != s_local)
+    if (0 != s_local_mask)
     {
         /* ★ 本地接管: 跳过 1)/2)/3) 三道"上位机门", 只亮信息位。
            4)/5) 照旧在下面判 —— 那是"MCU 自己还活着"的门, 不许绕。 */
@@ -191,7 +203,7 @@ uint8 spd_safety_allow (uint8 ch)
 
     (void)ch;
 
-    if (0 != s_local)
+    if (0 != s_local_mask)
     {
         /* 本地接管: 1)/2)/3) 三道"上位机门"不参与判定; 4)/5) 与急停照旧 */
         block &= ~(SAFE_BIT_NEVER_RX | SAFE_BIT_NOT_EN | SAFE_BIT_LOST);

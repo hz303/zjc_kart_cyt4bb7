@@ -82,6 +82,7 @@
 #define UM_PF       (1u)
 #define UM_MODE     (2u)
 #define UM_RPS      (3u)
+#define UM_SLOT     (4u)    /* ★ 路表槽号 0~4：选完**立即**载入 RAM */
 
 typedef struct
 {
@@ -106,10 +107,15 @@ static const um_item_t UM_ITEMS[] =
     { "3.Rec/Save",    UM_ACT,   act_rtrec,   0u  },
     { "4.Rt ds",       UM_PF,    0,           39u },   /* 路表|采样点距（0.05~0.15，步长 0.01）*/
     { "5.Rt Status",   UM_ACT,   act_sts,     0u  },
-    { "6.Follow",      UM_MODE,  0,           0u  },   /* pb_mode：1=PUSH 2=PWR */
-    { "7.Speed",       UM_RPS,   0,           0u  },   /* 0.8~3.0 rps，步长 0.1 */
-    { "8.Save Par",    UM_ACT,   act_psave,   0u  },   /* ★ 写 Flash 页 0 */
-    { "9.Reset",       UM_ACT,   act_reset,   0u  },   /* 参数恢复默认（只写 RAM）*/
+    /* ★ 2026-10-21：**选槽**。以前换表只能用 PC 的 route_send.py，
+       现场只有屏幕时没法把"电子表槽 2"换成"手推录的槽 0"。
+       K3/K4 一按就生效（不用再按 K1）：先校验、再选 active、然后立刻载入 RAM；
+       空槽/正在跟随/正在录制/正在落盘 一律拒绝，并把原因写在标题行。 */
+    { "6.Slot",        UM_SLOT,  0,           0u  },
+    { "7.Follow",      UM_MODE,  0,           0u  },   /* pb_mode：1=PUSH 2=PWR */
+    { "8.Speed",       UM_RPS,   0,           0u  },   /* 0.8/1.2/2.4 rps 三档 */
+    { "9.Save Par",    UM_ACT,   act_psave,   0u  },   /* ★ 写 Flash 页 0 */
+    { "10.Reset",      UM_ACT,   act_reset,   0u  },   /* 参数恢复默认（只写 RAM）*/
 };
 
 #define UM_NITEMS   ((uint8)(sizeof(UM_ITEMS) / sizeof(UM_ITEMS[0])))
@@ -194,6 +200,13 @@ static uint8 um_read(uint8 idx, float *v, float *lo, float *hi, float *st)
             *v  = (pb_en < 0.5f) ? 0.0f : ((pb_mode > 1.5f) ? 2.0f : 1.0f);
             *lo = 0.0f;
             *hi = 2.0f;
+            *st = 1.0f;
+            return 1u;
+
+        case UM_SLOT:                       /* 槽号：读的是"当前 active"，写见 um_write */
+            *v  = (float)ins_route_slot_active();
+            *lo = 0.0f;
+            *hi = (float)(INS_RT_SLOT_COUNT - 1u);
             *st = 1.0f;
             return 1u;
 
@@ -319,6 +332,63 @@ static void um_write(uint8 idx, float v)
                 }
             }
             break;
+
+        case UM_SLOT:
+        {
+            uint8                 sl   = (uint8)(v + 0.5f);
+            uint8                 prev = ins_route_slot_active();
+            ins_route_slot_info_t inf;
+
+            /* ---- 三种状态下不许换表 ----
+               ① 跟随在跑（含 PUSH）：换表会让"最近点"当场跳到另一条曲线上；
+               ② 正在录制：换表等于把正在录的点丢掉（RAM 表被覆盖）；
+               ③ 正在落盘：页写中途去读别的页，两边都拖慢，还容易误判失败。 */
+            if ((pb_en > 0.5f) || (0u != route_pb_active()))
+            {
+                snprintf(s_msg, sizeof(s_msg), "REFUSE: follow ON");
+                break;
+            }
+            if (0u != ins_route_is_running())
+            {
+                snprintf(s_msg, sizeof(s_msg), "REFUSE: recording");
+                break;
+            }
+            if (0u != ins_route_flash_busy())
+            {
+                snprintf(s_msg, sizeof(s_msg), "REFUSE: flash busy");
+                break;
+            }
+            if (sl >= (uint8)INS_RT_SLOT_COUNT) { break; }
+            if (sl == prev)
+            {
+                snprintf(s_msg, sizeof(s_msg), "S%u already", (unsigned)sl);
+                break;
+            }
+
+            /* 空槽直接拒绝：切过去只会在 7.Follow 那里报 no table，
+               而且 active_slot 已经被写坏（下次上电还是空槽）。 */
+            if ((0u == ins_route_slot_info(sl, &inf)) || (0u == inf.valid))
+            {
+                snprintf(s_msg, sizeof(s_msg), "S%u EMPTY", (unsigned)sl);
+                break;
+            }
+
+            if (0u != ins_route_slot_set_active(sl, 1u))
+            {
+                snprintf(s_msg, sizeof(s_msg), "S%u set FAIL", (unsigned)sl);
+                break;
+            }
+            if (0u == ins_route_flash_load_slot(sl))
+            {
+                /* 索引说有表、页上却读不出来（半写/掉电）⇒ 回滚，别留下"选了个空槽" */
+                (void)ins_route_slot_set_active(prev, 1u);
+                snprintf(s_msg, sizeof(s_msg), "S%u LOAD FAIL", (unsigned)sl);
+                break;
+            }
+            snprintf(s_msg, sizeof(s_msg), "S%u loaded %upt",
+                     (unsigned)sl, (unsigned)inf.count);
+            break;
+        }
 
         case UM_RPS:
         {
@@ -504,6 +574,23 @@ static void um_value_text(uint8 idx, char *out, uint8 size)
             snprintf(out, size, "%s rps", t);
             break;
 
+        case UM_SLOT:
+        {
+            /* ⚠ 点数必须显示出来：现场选槽就是"哪一槽有表、表多长"，
+               只给个 S2 等于没给信息（`ins_route_slot_info` 只读一页索引，很便宜）。 */
+            uint8                 sl = (uint8)(v + 0.5f);
+            ins_route_slot_info_t inf;
+
+            if (0u != ins_route_flash_busy()) { snprintf(out, size, "S%u SAV", (unsigned)sl); break; }
+            if ((0u == ins_route_slot_info(sl, &inf)) || (0u == inf.valid))
+            {
+                snprintf(out, size, "S%u empty", (unsigned)sl);
+                break;
+            }
+            snprintf(out, size, "S%u %upt", (unsigned)sl, (unsigned)inf.count);
+            break;
+        }
+
         default:                                /* PF：参数原始值 */
             ui_ftoa(t, sizeof(t), v, 3u);
             snprintf(out, size, "%s", t);
@@ -581,6 +668,12 @@ static void um_draw_edit(void)
         snprintf(line, sizeof(line), "= %s rps", t);
         um_puts(3u, 0u, line);
     }
+    else if (UM_SLOT == it->kind)
+    {
+        snprintf(line, sizeof(line), "= S%u (now S%u)",
+                 (unsigned)(v + 0.5f), (unsigned)ins_route_slot_active());
+        um_puts(3u, 0u, line);
+    }
     else
     {
         ui_ftoa(t, sizeof(t), v, 4u);
@@ -612,6 +705,32 @@ static void um_draw_edit(void)
         snprintf(line, sizeof(line), "%.18s", route_pb_reason());
         um_puts(6u, 0u, line);
     }
+    else if (UM_SLOT == it->kind)
+    {
+        /* 选槽前必须看得见"这一槽有没有表、多少点、多长"——
+           否则现场会在"7.Follow 报 no table"那里绕一圈才想到是槽选错了。 */
+        ins_route_slot_info_t inf;
+        uint8                 sl = (uint8)(v + 0.5f);
+
+        if ((0u != ins_route_slot_info(sl, &inf)) && (0u != inf.valid))
+        {
+            snprintf(line, sizeof(line), "n=%u  %u.%02u m",
+                     (unsigned)inf.count,
+                     (unsigned)(inf.lap_mm / 1000u),
+                     (unsigned)((inf.lap_mm % 1000u) / 10u));
+            um_puts(4u, 0u, line);
+            snprintf(line, sizeof(line), "ds=%u mm", (unsigned)inf.ds_mm);
+            um_puts(5u, 0u, line);
+            snprintf(line, sizeof(line), "crc %04X", (unsigned)(inf.crc_r & 0xFFFFu));
+            um_puts(6u, 0u, line);
+        }
+        else
+        {
+            um_puts(4u, 0u, "EMPTY - no table");
+            um_puts(5u, 0u, "");
+            um_puts(6u, 0u, "");
+        }
+    }
     else
     {
         ui_ftoa(t, sizeof(t), st, 3u);
@@ -630,8 +749,16 @@ static void um_draw_edit(void)
     /* 拒跑原因（REFUSE busy / no table …）也留在编辑页，别让用户"按了没反应" */
     if (s_msg[0] != '\0') { um_puts(7u, 0u, s_msg); }
 
-    um_puts(8u,  0u, "K3/K4 = -/+");
-    um_puts(9u,  0u, "K1 = OK  K2 = Back");
+    if (UM_SLOT == it->kind)
+    {
+        um_puts(8u,  0u, "K3/K4 = slot   K1 = back");
+        um_puts(9u,  0u, "(-/+ applies now)");
+    }
+    else
+    {
+        um_puts(8u,  0u, "K3/K4 = -/+");
+        um_puts(9u,  0u, "K1 = OK  K2 = Back");
+    }
 }
 
 /*===================================================================================================================

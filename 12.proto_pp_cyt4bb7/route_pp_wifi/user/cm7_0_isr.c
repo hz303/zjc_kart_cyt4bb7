@@ -44,6 +44,7 @@
 #include "ins_odom.h"
 #include "spd_bench.h"
 #include "head_test.h"
+#include "route_link.h"      /* route_link_uart_irq() */
 
 
 
@@ -204,7 +205,7 @@ void uart0_isr (void)
     {
         
 #if DEBUG_UART_USE_INTERRUPT             // 如果开启 debug 串口中断
-        debug_interrupr_handler();       // 调用 debug 串口接收处理函数 数据会被 debug 环形缓冲区读取
+        route_link_uart_irq();           /* 2026-10-21: 串口灌表(route_link)的接收口 */   /* 2026-10-21: 串口灌表(route_link) 的接收口；debug 控制台输入没人用，见工程 8 同款接法 */
 #endif                                   // 如果修改了 DEBUG_UART_INDEX 那这段代码需要放到对应的串口中断去
       
     }
