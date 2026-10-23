@@ -1,23 +1,19 @@
-/*********************************************************************************************************************
- * 双电机速度环(WiFi) - 保护与门控(唯一收口)
- *
+/* 双电机速度环(WiFi) - 保护与门控(唯一收口)
  * 这一层的唯一职责:**决定"这一拍到底允不允许电机出力"**, 并把上限压给控制器。
- *
  * ---- 五道门(全部满足才允许闭环输出) ------------------------------------------------
- *   1) 上位机曾经说过话      : 上电以来至少收到过一帧下行(motor_link_ever_rx)
- *                            -> 没连过上位机就绝不自转
- *   2) 使能位图              : bit1(电机) 且 bit2(总使能) 都置位
- *   3) 失联自停              : auto_stop=1 且链路超过 lost_ms 没收到下行 -> 目标归零
- *   4) 主循环心跳            : 主循环每圈调 spd_safety_heartbeat();
- *                            超过 200ms 没心跳(主循环卡死/被遥控阻塞) -> 直接停机
- *   5) 占空比限幅            : duty_limit% 压给控制器的 u_max(每拍下压, 抗饱和才真实)
- *                            并且 motor_drv 里还有一道物理收口(|u|<=1)
- *
+ * 1) 上位机曾经说过话      : 上电以来至少收到过一帧下行(motor_link_ever_rx)
+ * -> 没连过上位机就绝不自转
+ * 2) 使能位图              : bit1(电机) 且 bit2(总使能) 都置位
+ * 3) 失联自停              : auto_stop=1 且链路超过 lost_ms 没收到下行 -> 目标归零
+ * 4) 主循环心跳            : 主循环每圈调 spd_safety_heartbeat();
+ * 超过 200ms 没心跳(主循环卡死/被遥控阻塞) -> 直接停机
+ * 5) 占空比限幅            : duty_limit% 压给控制器的 u_max(每拍下压, 抗饱和才真实)
+ * 并且 motor_drv 里还有一道物理收口(|u|<=1)
  * ---- 配置合法性自检 -----------------------------------------------------------------
- *   通道数、周期、PWM 频率这些"写死在宏里、错了就整台车不对"的东西, 上电时查一遍。
- *   注意: 检查必须放运行期 -- 在 #if 里写浮点常量 IAR 会报
- *         "floating constant in preprocessor expression"(这个坑本项目踩过两次)。
- ********************************************************************************************************************/
+ * 通道数、周期、PWM 频率这些"写死在宏里、错了就整台车不对"的东西, 上电时查一遍。
+ * 注意: 检查必须放运行期 -- 在 #if 里写浮点常量 IAR 会报
+ * "floating constant in preprocessor expression"(这个坑本项目踩过两次)。
+ */
 
 #ifndef _SPD_SAFETY_H
 #define _SPD_SAFETY_H
@@ -25,84 +21,70 @@
 #include "zf_common_headfile.h"
 
 /* 保护状态位图(遥测 CH_SAFETY, 0 = 一切正常) */
-#define SAFE_BIT_NEVER_RX   (0x0001u)       /* 上电以来还没收到过下行帧        */
+#define SAFE_BIT_NEVER_RX   (0x0001u)       /* 上电以来还没收到过下行帧 */
 #define SAFE_BIT_NOT_EN     (0x0002u)       /* 使能位缺失(bit1 电机 / bit2 总) */
-#define SAFE_BIT_LOST       (0x0004u)       /* 失联(超 lost_ms)                */
-#define SAFE_BIT_NO_HB      (0x0008u)       /* 主循环心跳丢失(卡死)            */
-#define SAFE_BIT_CFG_BAD    (0x0010u)       /* 配置自检不过                    */
-#define SAFE_BIT_OVER_LIM   (0x0020u)       /* 本拍被占空比限幅夹过            */
-#define SAFE_BIT_LOCAL      (0x0040u)       /* ★ 本地接管中(信息位, 不阻塞)     */
-#define SAFE_BIT_ESTOP      (0x0080u)       /* ★ 遥控急停(CH5): 全局硬停机, **不可被本地接管替换** */
+#define SAFE_BIT_LOST       (0x0004u)       /* 失联(超 lost_ms) */
+#define SAFE_BIT_NO_HB      (0x0008u)       /* 主循环心跳丢失(卡死) */
+#define SAFE_BIT_CFG_BAD    (0x0010u)       /* 配置自检不过 */
+#define SAFE_BIT_OVER_LIM   (0x0020u)       /* 本拍被占空比限幅夹过 */
+#define SAFE_BIT_LOCAL      (0x0040u)
+#define SAFE_BIT_ESTOP      (0x0080u)
 
-/*===================================================================================================================
- *  ★★ 本地接管 spd_safety_set_local()：把 1)/2)/3) 三道【上位机门】换掉
- *
- *  为什么需要（2026-10-13，为遥控而加）：
- *    菜单 / 遥控 / 任何"人就在车边上"的操作，都**不以上位机连上为前提**。
- *    可前三道门是"上位机在场"：没连过上位机(1)、没收到使能位(2)、链路离线(3)
- *    —— SPI 都没插的时候这三道门会把电机**永久锁死**，而且**一个错都不报**。
- *    遥控器是独立控制车辆的，插不插 WiFi 都要能开，所以必须能把这层掀掉。
- *
- *  替换规则：
- *      local = 1 -> 跳过 1)/2)/3)，改为亮 SAFE_BIT_LOCAL(信息位, 不阻塞)
- *      local = 0 -> 完全恢复上面五道门
- *  ⚠⚠ **4) 主循环心跳 与 5) 占空比限幅 永远生效，不参与替换。**
- *       本地接管换掉的是"上位机在场"，不是"MCU 还活着"。主循环一卡死照样立刻停机，
- *       否则 5ms 中断里的控制器会在主循环死掉之后继续给占空比 —— 那才是真失控。
- *       同理限幅也不许绕：遥控全油门也必须走 duty_limit。
- *  ⚠ 谁来推这个档位：见 remote_ctrl.c —— 遥控【接管状态 = ON】时才置 1，
- *     退出/失控/开关收回立刻置 0。不是菜单里一个闩锁。
- *=================================================================================================================*/
+/* 菜单 / 遥控 / 任何"人就在车边上"的操作，都**不以上位机连上为前提**。
+ * 可前三道门是"上位机在场"：没连过上位机(1)、没收到使能位(2)、链路离线(3)
+ * —— SPI 都没插的时候这三道门会把电机**永久锁死**，而且**一个错都不报**。
+ * 遥控器是独立控制车辆的，插不插 WiFi 都要能开，所以必须能把这层掀掉。
+ * 替换规则：
+ * local = 1 -> 跳过 1)/2)/3)，改为亮 SAFE_BIT_LOCAL(信息位, 不阻塞)
+ * local = 0 -> 完全恢复上面五道门
+ * 否则 5ms 中断里的控制器会在主循环死掉之后继续给占空比 —— 那才是真失控。
+ * 同理限幅也不许绕：遥控全油门也必须走 duty_limit。
+ * 退出/失控/开关收回立刻置 0。不是菜单里一个闩锁。
+ */
 #define SPD_HB_TIMEOUT_MS_PUB   (200u)      /* 主循环心跳超时(与 .c 里一致, 便于外部判读) */
 
 /* 占空比限幅(%): 硬顶 SPD_DUTY_HARD_MAX, 上电默认 SPD_DUTY_DEFAULT
- *   ⚠ 2026-10-18 默认 30 → 60；⚠ 2026-10-22 再 **60 → 80**（配合 target_max 3.2 rps）。
- *     80 恰好等于硬顶 ⇒ 上电后这道限幅**等于不生效**；要保守就现场把 duty_limit 拖回 50 再 ParmSve。
- *   ⚠⚠ **80% 不是"安全值"**：这是这颗板子上唯一的输出硬约束，热和电流都靠它兜。
- *      按落地标定 `v[rps] = 0.069·(u% − 5.68)`，3.2 rps 只需要 **≈52%**；
- *      80% 的余量是给"上坡/加速/带载"用的，**长时间顶到 80% 会热**（DRV8701E + 电机）。
- *      温度或母线电流没底时，先把 duty_limit 压到 60~65 再试。
- *   ⚠ 这个宏是**唯一权威**，两处引用它：
- *       ① 本文件对应 .c 里 spd_duty_limit_pct 的初值
- *       ② motor_link.h 参数表 ID2 的默认值（点"恢复默认值"回落到这里，不会回 30）
- *     （踩过 k_z 的坑：同一个数在宏/参数表/上位机各写一个，点一次恢复默认行为就变了） */
+ * 80 恰好等于硬顶 ⇒ 上电后这道限幅**等于不生效**；要保守就现场把 duty_limit 拖回 50 再 ParmSve。
+ * 按落地标定 `v[rps] = 0.069·(u% − 5.68)`，3.2 rps 只需要 **≈52%**；
+ * 80% 的余量是给"上坡/加速/带载"用的，**长时间顶到 80% 会热**（DRV8701E + 电机）。
+ * 温度或母线电流没底时，先把 duty_limit 压到 60~65 再试。
+ * ① 本文件对应 .c 里 spd_duty_limit_pct 的初值
+ * ② motor_link.h 参数表 ID2 的默认值（点"恢复默认值"回落到这里，不会回 30）
+ * （踩过 k_z 的坑：同一个数在宏/参数表/上位机各写一个，点一次恢复默认行为就变了）
+ */
 #define SPD_DUTY_HARD_MAX   (80.0f)
 #define SPD_DUTY_DEFAULT    (80.0f)
 
-extern volatile float   spd_duty_limit_pct;     /* 占空比限幅 %(上位机可改)  */
-extern volatile float   spd_lost_ms;            /* 失联判定延时 ms           */
-extern volatile float   spd_auto_stop;          /* 失联自停 1/0              */
+extern volatile float   spd_duty_limit_pct;     /* 占空比限幅 %(上位机可改) */
+extern volatile float   spd_lost_ms;            /* 失联判定延时 ms */
+extern volatile float   spd_auto_stop;          /* 失联自停 1/0 */
 
 void    spd_safety_init         (void);
 void    spd_safety_tick         (void);         /* 5ms: 更新保护状态(由 spd_ctrl_tick 调) */
-void    spd_safety_heartbeat    (void);         /* 主循环每圈调一次                       */
+void    spd_safety_heartbeat    (void);         /* 主循环每圈调一次 */
 
-/* ★ 本地接管：1 = 换掉"上位机三道门"(1/2/3)，4)/5) 仍生效。见上面长注释。 */
-/* ★★ 2026-10-21：本地授权改成**按来源 OR**（谁在驱动谁点灯）。
-   以前是一个 uint8：遥控每 5 ms 往 OFF/FAILSAFE 分支里写 0，会把回放刚点的灯灭掉
-   ⇒ PWR 永远过不了 SAFE_BIT_NOT_EN（"PUSH 正常、PWR 电机一动不动"的根因）。 */
+/* ⇒ PWR 永远过不了 SAFE_BIT_NOT_EN（"PUSH 正常、PWR 电机一动不动"的根因）。 */
 #define SPD_LOCAL_SRC_RC        (0x01u)     /* 遥控（ON / STANDBY 时点） */
 #define SPD_LOCAL_SRC_PB        (0x02u)     /* 路表回放 PWR */
 #define SPD_LOCAL_SRC_BENCH     (0x04u)     /* 保留：跑班（目前走遥控/上位机使能） */
 void    spd_safety_set_local_src(uint8 src, uint8 on);
 void    spd_safety_set_local    (uint8 on);      /* 兼容旧调用 = 只动"遥控"那一位 */
-uint8   spd_safety_local        (void);         /* 当前档位(回读, 诊断用)                 */
+uint8   spd_safety_local        (void);         /* 当前档位(回读, 诊断用) */
 
-/* ★★ 遥控急停（CH5）。**全局硬停机**，与"谁在开车"无关：
-       on=1 -> 亮 SAFE_BIT_ESTOP，输出**无条件**钉 0；**本地接管档位也替不掉它**。
-     这是刻意的：急停属于"车要停"这件事，不是"控制权归谁"。
-     ⇒ 即使此刻是 WiFi 上位机在开车，拨一下遥控上的 CH5 也能把车停住。 */
+/* on=1 -> 亮 SAFE_BIT_ESTOP，输出**无条件**钉 0；**本地接管档位也替不掉它**。
+ * 这是刻意的：急停属于"车要停"这件事，不是"控制权归谁"。
+ * ⇒ 即使此刻是 WiFi 上位机在开车，拨一下遥控上的 CH5 也能把车停住。
+ */
 void    spd_safety_set_estop    (uint8 on);
 uint8   spd_safety_estop        (void);
 
-float   spd_safety_limit_u      (void);         /* 本拍允许的 |u| 上限(归一化)            */
-uint8   spd_safety_allow        (uint8 ch);     /* 该路是否允许闭环输出 1/0               */
-uint32  spd_safety_flags        (void);         /* 当前保护状态位图(遥测)                 */
-uint32  spd_safety_trip_take    (void);         /* 取走并清除"新发生的"停机事件           */
-uint8   spd_safety_cfg_bad      (void);         /* 配置自检结果位图(0 = 正常)             */
+float   spd_safety_limit_u      (void);         /* 本拍允许的 |u| 上限(归一化) */
+uint8   spd_safety_allow        (uint8 ch);     /* 该路是否允许闭环输出 1/0 */
+uint32  spd_safety_flags        (void);         /* 当前保护状态位图(遥测) */
+uint32  spd_safety_trip_take    (void);         /* 取走并清除"新发生的"停机事件 */
+uint8   spd_safety_cfg_bad      (void);         /* 配置自检结果位图(0 = 正常) */
 
-/* 控制器发现"本拍输出被 u_max 夹掉了"时调一次, 用来点亮 SAFE_BIT_OVER_LIM。
-   注意这是"每拍刷新"的瞬时位: 本拍没被夹, 下拍就会自动熄掉。 */
+/* 控制器发现"本拍输出被 u_max 夹掉了"时调一次, 用来点亮 SAFE_BIT_OVER_LIM。 注意这是"每拍刷新"的瞬时位: 本拍没被夹, 下拍就会自动熄掉。 */
 void    spd_safety_note_clip    (uint8 ch);
 
 #endif

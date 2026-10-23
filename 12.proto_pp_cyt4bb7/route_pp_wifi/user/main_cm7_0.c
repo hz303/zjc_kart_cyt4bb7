@@ -15,34 +15,28 @@
 * 您应该在收到本开源库的同时收到一份 GPL 的副本
 * 如果没有，请参阅<https://www.gnu.org/licenses/>
 *
-* 本工程 = 工程 7(steer_loop_wifi) + **遥控(工程 9 新增)**。
-*   基座 = 4.motor_wifi_verify_cyt4bb7（WiFi-SPI 链路 + 上位机 KartHost 通信，已验证跑通）
-*   控制 = 转向位置环 + 双后轮速度环（与工程 7 同）
-*   新增 = 逐飞 UART 接收机(SBUS) + remote_ctrl：**遥控独立于 WiFi**，
-*          插不插 WiFi 都能用发射机完整操控（说明见 remote_ctrl.h）
+ * 转向位置环 + 双后轮速度环；遥控（逐飞 UART 接收机 SBUS）独立于 WiFi，
+ * 插不插 WiFi 都能用发射机完整操控（见 remote_ctrl.h）。
+ * 上位机只下发"目标转速 rps"，闭环完全在车端跑，无开环占空比通道。
 *
-* 与基座工程的差别：**取消了开环占空比通道**。上位机只下发"目标转速 rps"，
-* 闭环完全在车端跑。开环标定请用另一个工程 5.speed_loop_vofa_cyt4bb7（串口 + VOFA+）。
-*
-* ---- 硬件连接（★ 2026-10-13 按队友 Karting-Project commit ca55f2b 更新到【最新线束】）----
+ * ---- 硬件连接 -----------------------------------------------------------------------
 *   左后轮:  PWM -> P09_0 (TCPWM_CH24)    DIR -> P09_1
 *   右后轮:  PWM -> P10_2 (TCPWM_CH30)    DIR -> P10_3
 *   转向  :  PWM -> P05_0 (TCPWM_CH09)    DIR -> P05_1
-*   (工程 7 用的那一版是 P05_2/P05_3 + P05_1/P05_0 + P10_2/P10_3，**已作废**；
-*    引脚一变, minv_l / minv_r / minv_s 三个极性必须重新核, 判据见 motor_drv.h 末尾)
-*   左后轮编码器: PULSE -> P17_3 (TC_CH58 CH1)   DIR -> P17_4 (TC_CH58 CH2)  [脉冲+方向]  ← 没变
-*   右后轮编码器: PULSE -> P19_2 (TC_CH27 CH1)   DIR -> P19_3 (TC_CH27 CH2)  [脉冲+方向]  ← 没变
-*   转向绝对角编码器: SPI_4(SCB5)  CLK P07_2 / MOSI P07_1 / MISO P07_0 / CS P07_3  ← 没变
+ *   (引脚一变, minv_l / minv_r / minv_s 三个极性必须重新核, 判据见 motor_drv.h 末尾)
+*   左后轮编码器: PULSE -> P17_3 (TC_CH58 CH1)   DIR -> P17_4 (TC_CH58 CH2)  [脉冲+方向]
+*   右后轮编码器: PULSE -> P19_2 (TC_CH27 CH1)   DIR -> P19_3 (TC_CH27 CH2)  [脉冲+方向]
+*   转向绝对角编码器: SPI_4(SCB5)  CLK P07_2 / MOSI P07_1 / MISO P07_0 / CS P07_3
 *   WiFi-SPI 模块: 见 motor_link.h（SPI_0 + INT P02_4 + RST P23_0）
 *   遥控接收机  : UART_4 = SCB2，RX = P14_0（接接收机的 TX），TX = P14_1（占位，悬空）
 *                 SBUS 100 kbps，6 通道；帧间隔计时占 TC_TIME2_CH2。见 zf_device_uart_receiver.h
 *
-* ---- ★ 三个必须先做的台架标定（顺序不能颠倒）--------------------------------------
-*   第零步 硬件极性（**换脚之后一定要重做, 这是唯一会烧东西的一步**）:
+ * ---- 三个必须先做的台架标定（顺序不能颠倒）--------------------------------------
+ *   第零步 硬件极性（**上电前一定要做, 这是唯一会烧东西的一步**）:
 *           车架空 -> 上位机把「转向|内环使能」打开 -> 先只给 steer_u0 看方向盘能不能被推动,
 *           再给一个很小的目标角(比如 +3 度), 看方向盘是"朝目标去"还是"背着目标跑"。
 *           背着跑 = mot_inv_s 给反了 => **立刻停手**, 把「转向|电机极性」改成 0 再试。
-*           (后果: 正反馈会一路顶住机械限位堵转, 把 DRV8701 烧掉 —— 已经烧过一个。)
+ *           (正反馈会一路顶住机械限位堵转, 烧毁 DRV8701。)
 *           后轮同理但没风险: 给小的正目标看轮子是不是朝"车前进"方向转, 反了改 minv_l/minv_r。
 *   第零步b 遥控: 先只用 Debug 看 CH1/CH2 是否在中位 992 附近, 再拨 CH5 看 eng 是否 0->1->2。
 *           详细判读见 motor_print_status() 里"RC 一行"那段注释。
@@ -75,29 +69,25 @@
 #include "ui_menu.h"
 #include "route_app.h"          /* 路表(P1): 应用层 */
 #include "route_pb.h"
-#include "proto.h"              /* ★ 通信统一：协议层/权限层（唯一写入口） */
+#include "proto.h"
 #include "head_test.h"            /* 工程11: 航向测试 */
 
-/*===================================================================================================================
- *  内部状态
- *=================================================================================================================*/
+/* 内部状态 */
 static uint32   g_print_ms = 0;        /* 上次打印状态的时刻 */
 static uint8    g_zero_last    = 0;   /* 惯导|位姿归零 命令的边沿记忆(0->1 只触发一次) */
 static uint32   g_imu_retry_ms  = 0;   /* IMU 掉线后的重试节拍(1Hz) */
 
-/*===================================================================================================================
- *  遥测通道填充（顺序即协议，见 motor_link.h 第四节）
- *=================================================================================================================*/
+/* 遥测通道填充（顺序即协议，见 motor_link.h 第四节） */
 static void motor_fill_telemetry (void)
 {
     uint32 age;
 
-    /* ★★★ 标定精简档案（16 通道）—— 由参数 `tel_sel`（>0.5）切进来，见 motor_link.h 第五节。
-       落地标定要长时间高密度采数据，34/37 通道一帧把带宽吃满；16 通道一帧只有 85 字节，
-       同样的链路能把遥测周期压到 5~10 ms。
-       [!] 这里**直接 return**：标定档的通道号(CT_*)与全量档(CH_*)完全不是一回事，
-         绝不能"填一半再叠一半"，否则上位机看到的是两份数据混在一起。
-       [!] 切档时上位机的"档案"下拉框也要跟着切到「标定·精简」，否则通道名错位。 */
+    /* 落地标定要长时间高密度采数据，34/37 通道一帧把带宽吃满；16 通道一帧只有 85 字节，
+     * 同样的链路能把遥测周期压到 5~10 ms。
+     * [!] 这里**直接 return**：标定档的通道号(CT_*)与全量档(CH_*)完全不是一回事，
+     * 绝不能"填一半再叠一半"，否则上位机看到的是两份数据混在一起。
+     * [!] 切档时上位机的"档案"下拉框也要跟着切到「标定·精简」，否则通道名错位。
+     */
     if (spd_tel_sel > 0.5f)
     {
         age = motor_link_rx_age_ms();
@@ -112,9 +102,7 @@ static void motor_fill_telemetry (void)
         motor_link_ch_set(CT_TARGET_R,    spd_target_r);
         motor_link_ch_set(CT_V_R,         enc_r.rps);
         motor_link_ch_set(CT_U_R,         ctl_r.u * 100.0f);
-        /* ★ 发【实际施加】的目标（软限位夹紧 + 斜坡之后），不是上位机写的命令 ——
-           理由同增益回读：斜坡开着时若发命令，波形上是一条干净阶跃，
-           会把"斜坡造成的滞后"算到机械/增益头上。见 motor_link.h 的 CH_STEER_TARGET 注解。 */
+        /* 会把"斜坡造成的滞后"算到机械/增益头上。见 motor_link.h 的 CH_STEER_TARGET 注解。 */
         motor_link_ch_set(CT_STEER_TGT,   steer.applied_delta);
         motor_link_ch_set(CT_STEER_DELTA, steer.meas_delta);
         motor_link_ch_set(CT_STEER_U,     (float)steer.output_duty);
@@ -126,8 +114,7 @@ static void motor_fill_telemetry (void)
                           (float)(steer_abs_self_check_ok() | ((uint16)steer_ctrl_fault() << 1)));
         motor_link_ch_set(CT_OL_EN,       (spd_ol_en > 0.5f) ? 1.0f : 0.0f);
         motor_link_ch_set(CT_RESV0,       0.0f);
-        /* ★ 增益回读: 发的是控制器本拍真正乘上去的那两个数（见 motor_link.h 的 CH_K_V 注解）——
-           "滑条上的数"和"车上真正跑的数"不是一回事，这两个通道就是唯一权威。 */
+        /* "滑条上的数"和"车上真正跑的数"不是一回事，这两个通道就是唯一权威。 */
         motor_link_ch_set(CT_K_V,         spd_g.k_v);
         motor_link_ch_set(CT_K_Z,         spd_g.k_z);
         return;
@@ -157,35 +144,34 @@ static void motor_fill_telemetry (void)
     motor_link_ch_set(CH_SAFETY,      (float)spd_safety_flags());
 
     /* --- 转向(16~20) --- */
-    motor_link_ch_set(CH_STEER_TARGET, steer.applied_delta);   /* ★ 实际施加目标，非上位机写的命令 */
+    motor_link_ch_set(CH_STEER_TARGET, steer.applied_delta);
     motor_link_ch_set(CH_STEER_DELTA,  steer.meas_delta);
     motor_link_ch_set(CH_STEER_U,      (float)steer.output_duty);
     motor_link_ch_set(CH_STEER_EN,     (float)steer.angle_enable);
     /* bit0   = 绝对编码器上电自检通过
-       bit1   = 0x02 **反馈失效（锁存）** —— 输出已钉 0；会自动复位(限次数), 也能人工 steer_en 0->1
-       bit2   = 0x04 顶死/无进展**告警**（不钉输出, 粘滞 2s）
-       bit3   = 0x08 **本拍编码器读数被防抖拒掉**（瞬态、不锁存）—— "电机干扰编码器"最早的预警。
-                ★ 2026-10-16 加：现场"打死后再也控不动方向盘"的定位就靠这四位里的 bit1/bit3。
-                [!] 判读顺序: bit3 闪 -> 丢样计数在涨 -> 才是 bit1。别一看到 bit1 就去改机械。 */
+     * bit1   = 0x02 **反馈失效（锁存）** —— 输出已钉 0；会自动复位(限次数), 也能人工 steer_en 0->1
+     * bit2   = 0x04 顶死/无进展**告警**（不钉输出, 粘滞 2s）
+     * bit3   = 0x08 **本拍编码器读数被防抖拒掉**（瞬态、不锁存）—— "电机干扰编码器"最早的预警。
+     * [!] 判读顺序: bit3 闪 -> 丢样计数在涨 -> 才是 bit1。别一看到 bit1 就去改机械。
+     */
     motor_link_ch_set(CH_STEER_STATUS,
                       (float)(steer_abs_self_check_ok() | ((uint16)steer_ctrl_fault() << 1)));
 
-    /* --- ★ 遥控(21~24): 精简到 4 个 —— 只留"谁在开车"(rc_eng) + 核摇杆/核油门的原始值
-       + 接收机帧数。rc_estop/rc_steer_deg/rc_thr/rc_scale/rc_tgt_rps/ch5/ch6 全删:
-       它们要么是别的通道的中间量(steer_tgt/target_l/rps), 要么只在一次性标定时看。 --- */
+    /* + 接收机帧数。rc_estop/rc_steer_deg/rc_thr/rc_scale/rc_tgt_rps/ch5/ch6 全删:
+     * 它们要么是别的通道的中间量(steer_tgt/target_l/rps), 要么只在一次性标定时看。 ---
+     */
     motor_link_ch_set(CH_RC_ENGAGE,    (float)RC_Engage);
     motor_link_ch_set(CH_RC_CH1,       (float)RC_Raw_Ch1);
     motor_link_ch_set(CH_RC_CH2,       (float)RC_Raw_Ch2);
     motor_link_ch_set(CH_RC_FRAMES,    (float)RC_Frames);
 
-    /* --- ★★ 增益回读(25~26): 2026-10-14 新增。理由见 motor_link.h 的 CH_K_V 注解 --- */
     motor_link_ch_set(CH_K_V,          spd_g.k_v);
     motor_link_ch_set(CH_K_Z,          spd_g.k_z);
 
-    /* --- ** 惯导(39~44): 工程 10(2026-10-15) 新增。坐标约定见 motor_link.h 的 CH_INS_YAW 注解。
-       [!] 必须走**原子快照**: ins_imu_snapshot() / ins_odom_snapshot()。
-           直接读全局变量会在"中断正在更新"时拿到撕裂值(半新半旧), 上位机画出来的轨迹
-           会出现**锯齿/回跳** —— 而且只在车动的时候出现, 静止测不出来。 */
+    /* [!] 必须走**原子快照**: ins_imu_snapshot() / ins_odom_snapshot()。
+     * 直接读全局变量会在"中断正在更新"时拿到撕裂值(半新半旧), 上位机画出来的轨迹
+     * 会出现**锯齿/回跳** —— 而且只在车动的时候出现, 静止测不出来。
+     */
     {
         ins_imu_snap_t  imu;
         ins_odom_snap_t odom;
@@ -201,44 +187,39 @@ static void motor_fill_telemetry (void)
         motor_link_ch_set(CH_INS_DIST, odom.dist_abs);
 
         /* 状态位图(8 位, 与工程 8 同一套顺序, 上位机/文档别改) */
-        if (ins_imu_ready())                 { f |= 0x01u; }   /* IMU 就绪(零偏标定完)  */
-        if (imu.flags & INS_ST_MAG_CAL_DONE) { f |= 0x02u; }   /* 磁力计已标定          */
-        if (odom.flags & ODOM_ST_STILL)      { f |= 0x04u; }   /* 判定静止(ZUPT 窗口)   */
-        if (odom.flags & ODOM_ST_SLIP)       { f |= 0x08u; }   /* 本拍判打滑(只报警)    */
-        if (imu.flags & INS_ST_IMU_LINK_BAD) { f |= 0x40u; }   /* IMU 通信坏            */
-        if (imu.flags & INS_ST_WARN)         { f |= 0x80u; }   /* 其它告警              */
+        if (ins_imu_ready())                 { f |= 0x01u; }   /* IMU 就绪(零偏标定完) */
+        if (imu.flags & INS_ST_MAG_CAL_DONE) { f |= 0x02u; }   /* 磁力计已标定 */
+        if (odom.flags & ODOM_ST_STILL)      { f |= 0x04u; }   /* 判定静止(ZUPT 窗口) */
+        if (odom.flags & ODOM_ST_SLIP)       { f |= 0x08u; }   /* 本拍判打滑(只报警) */
+        if (imu.flags & INS_ST_IMU_LINK_BAD) { f |= 0x40u; }   /* IMU 通信坏 */
+        if (imu.flags & INS_ST_WARN)         { f |= 0x80u; }   /* 其它告警 */
         motor_link_ch_set(CH_INS_FLAGS, (float)f);
     }
 
-    /* --- 路表/回放(45~47): 工程 10(2026-10-17) P1/P2。口径见 motor_link.h --- */
     motor_link_ch_set(CH_RT_CNT,   (float)route_app_count());
     motor_link_ch_set(CH_RT_ST,    (float)route_app_status());
     motor_link_ch_set(CH_PB_ELAT,  route_pb_elat());
     /* CH36 = 航向外环的**实际输入**，按优先级：航向测试 > 航向环(PP/遥控) > 当前航向。
-       [why] 以前只发 head_test 的，PP 与遥控航向模式跑起来这一路恒 0，
-       上位机就画不出 tar_yaw vs ins_yaw 的跟随误差 —— 那正是外环唯一的评价量。 */
+     * [why] 以前只发 head_test 的，PP 与遥控航向模式跑起来这一路恒 0，
+     * 上位机就画不出 tar_yaw vs ins_yaw 的跟随误差 —— 那正是外环唯一的评价量。
+     */
     motor_link_ch_set(CH_TAR_YAW, (0u != head_test_active()) ? head_test_tar_yaw()
                                 : ((0u != steer.head_enable) ? steer_ctrl_get_target_yaw()
                                                              : ins_odom_get_yaw()));
     motor_link_ch_set(CH_HT_SEG,      head_test_seg());              /* 0关/1..n段/254完 */
 
-    /* --- 诊断三件套(38~40): 2026-10-20 晚加，用途见 motor_link.h 的 CH_TICK_MS 注解。
-       tick_ms   : 时基。掐 60 s 秒表对一对：涨约 60000 说明 5ms 时基准；涨 ~45000 说明中断被饿死
-                   或时基慢，那 yaw 少一块就跟 IMU 无关了。
-       ins_frz   : ZUPT 冻结期间被丢弃的转角(度, 累计, 只读不清)。
-                   转一圈它不为 0 且与缺口相当 = INS_ZUPT_FREEZE_YAW 把转角当零偏吃掉了。
-       ins_static: 冻结生效的那个条件本身(IMU 判静止)，不是 odom 的"编码器没动"。 */
+    /* tick_ms   : 时基。掐 60 s 秒表对一对：涨约 60000 说明 5ms 时基准；涨 ~45000 说明中断被饿死
+     * 或时基慢，那 yaw 少一块就跟 IMU 无关了。
+     * ins_frz   : ZUPT 冻结期间被丢弃的转角(度, 累计, 只读不清)。
+     * 转一圈它不为 0 且与缺口相当 = INS_ZUPT_FREEZE_YAW 把转角当零偏吃掉了。
+     * ins_static: 冻结生效的那个条件本身(IMU 判静止)，不是 odom 的"编码器没动"。
+     */
     motor_link_ch_set(CH_TICK_MS,    (float)motor_link_now_ms());
     motor_link_ch_set(CH_INS_FRZ,    ins_imu_zupt_frz_deg());
     motor_link_ch_set(CH_INS_STATIC, (float)((0u != (ins_imu_flags() & INS_ST_STATIC)) ? 1u : 0u));
 }
 
-/*===================================================================================================================
- *  定点打印小工具
- *
- *  刻意不用 %f：IAR 的 printf 在默认库配置下不一定支持浮点格式化，
- *  不值得为了一行日志去赌链接器的 formatter 配置。
- *=================================================================================================================*/
+/* 定点打印小工具 刻意不用 %f：IAR 的 printf 在默认库配置下不一定支持浮点格式化， 不值得为了一行日志去赌链接器的 formatter 配置。 */
 /* 打 2 位小数：返回整数部分，小数部分写进 *fp（-1.23 -> i=-1, f=23） */
 static int pf2 (float v, int *fp)
 {
@@ -263,11 +244,7 @@ static int pf2 (float v, int *fp)
 }
 
 /* 打 2 位小数的辅助宏：printf 里直接写 (int) 与 *fp 两个参数 */
-/*===================================================================================================================
- *  每 1 秒打印一次状态
- *
- *  这也是"出了事能自检"的兜底手段：只要这行在跳，就说明主循环活着、时钟活着、串口活着。
- *=================================================================================================================*/
+/* 每 1 秒打印一次状态 这也是"出了事能自检"的兜底手段：只要这行在跳，就说明主循环活着、时钟活着、串口活着。 */
 static void motor_print_status (void)
 {
     uint32 now;
@@ -296,14 +273,14 @@ static void motor_print_status (void)
     i4 = pf2(enc_r.rps,    &f4);
 
     /* int  = WiFi-SPI 模块的 INT(P02_4) 电平: 1=模块空闲可收发, 0=模块忙
-              (发送前会看这一位, 为 0 就整帧丢掉 -> 一个字节都不上 SPI)
-       tx   = 上电以来真正交给模块的遥测帧数, 应匀速增长(50/s)
-       ★ 判读: int=0 一直不变 -> 查 INT 这根线/模块供电;
-               int=1 但 tx 不涨 -> 驱动内部 mutex 卡 BUSY;
-               tx 在涨但上位机没数 -> WiFi/Socket(看 err=) 或目标 IP 不对 */
+     * (发送前会看这一位, 为 0 就整帧丢掉 -> 一个字节都不上 SPI)
+     * tx   = 上电以来真正交给模块的遥测帧数, 应匀速增长(50/s)
+     * int=1 但 tx 不涨 -> 驱动内部 mutex 卡 BUSY;
+     * tx 在涨但上位机没数 -> WiFi/Socket(看 err=) 或目标 IP 不对
+     */
     /* dL = 本拍(5ms)计数增量   fL = 真换向次数累计   gL = 读数毛刺丢弃次数累计
-       ★ dL 应该稳定在 cpr*v*0.005 附近(1.4rps -> 11~12); fL/gL 每秒只该 +0~1
-         若 fL 每秒涨几十上百 -> DIR 线在抖; 若 gL 在涨 -> 库内读 DIR 与我们读的不一致 */
+     * 若 fL 每秒涨几十上百 -> DIR 线在抖; 若 gL 在涨 -> 库内读 DIR 与我们读的不一致
+     */
     printf("[%6lu s] err=%u online=%u en=0x%04X rx_age=%lums safe=0x%04X int=%u tx=%lu | "
            "L tgt=%d.%02d v=%d.%02d | R tgt=%d.%02d v=%d.%02d | cpr=%lu/%lu "
            "| dL=%d fL=%lu gL=%lu\r\n",
@@ -323,14 +300,11 @@ static void motor_print_status (void)
            (unsigned long)enc_l.flip,
            (unsigned long)enc_l.glitch);
 
-    /* 航向自检（2026-10-20）：yaw 是**累积值**（不折叠），转一圈就该 +360。
-       rej = 被"单拍转角超限"闸门丢掉的拍数。**非 0 就意味着 yaw 被谁打断过**，
-       表现正是"转一圈角度残缺"（少一块），那时先查 SPI_2/供电，别去调外环。 */
+    /* rej = 被"单拍转角超限"闸门丢掉的拍数。**非 0 就意味着 yaw 被谁打断过**， 表现正是"转一圈角度残缺"（少一块），那时先查 SPI_2/供电，别去调外环。 */
     printf("[##] IMU yaw=%ld deg  rej=%u\r\n",
            (long)ins_imu_get_yaw(), (unsigned)ins_imu_yaw_rej());
 
-    /* 转向一行: 目标/实测转角、输出 duty、绝对编码器原始角与自检结果。
-       排障第一现场 —— 不动方向盘时 raw 应该稳定、delta 应该接近 0。 */
+    /* 转向一行: 目标/实测转角、输出 duty、绝对编码器原始角与自检结果。 排障第一现场 —— 不动方向盘时 raw 应该稳定、delta 应该接近 0。 */
     {
         /* 转角单位已改成"方向盘度", 用 pf2 打两位小数; 误差也打出来, 调 kp/u0 时最直观。 */
         int st_t, st_tf, st_d, st_df, st_e, st_ef;
@@ -339,13 +313,13 @@ static void motor_print_status (void)
         st_d  = pf2(steer.meas_delta,   &st_df);
         st_e  = pf2(steer.err,          &st_ef);
 
-        /* ★ 2026-10-16 加诊断字段（现场症状"打死之后方向盘彻底不动"就靠这一行定位）：
-             raw  = 环里**真正用**的值（防抖之后）
-             rl   = 本拍 SPI **实读**值（没防抖）—— raw 与 rl 差得远 = 防抖正在拒样，链路在变差
-             bad  = 上电以来被拒样数（只增）—— **只要它在涨，就说明电机在干扰编码器**
-             ar   = 自动复位次数（只增）—— >0 = 真的发生过"锁存->自动复位"
-             flt  = 状态位: 0x01 反馈失效(锁存,会钉输出) / 0x02 顶死告警 / 0x04 **本拍在丢样**(瞬态)
-                    -> 现场判读顺序: 先看 flt&0x04 闪不闪(预警) -> 再看 bad 涨不涨 -> 最后才看 0x01 */
+        /* raw  = 环里**真正用**的值（防抖之后）
+         * rl   = 本拍 SPI **实读**值（没防抖）—— raw 与 rl 差得远 = 防抖正在拒样，链路在变差
+         * bad  = 上电以来被拒样数（只增）—— **只要它在涨，就说明电机在干扰编码器**
+         * ar   = 自动复位次数（只增）—— >0 = 真的发生过"锁存->自动复位"
+         * flt  = 状态位: 0x01 反馈失效(锁存,会钉输出) / 0x02 顶死告警 / 0x04 **本拍在丢样**(瞬态)
+         * -> 现场判读顺序: 先看 flt&0x04 闪不闪(预警) -> 再看 bad 涨不涨 -> 最后才看 0x01
+         */
         printf("        STEER tgt=%d.%02d delta=%d.%02d err=%d.%02d duty=%d raw=%u rl=%u en=%u "
                "flt=0x%02X sc=%u bad=%u ar=%lu\r\n",
                st_t, st_tf,
@@ -362,16 +336,16 @@ static void motor_print_status (void)
     }
 
     /* 遥控一行: 接管状态 / 两个开关 / 指令量 / 收帧数 / 遥测档。
-       ★ 判读(不接管时按这个顺序查):
-           FRM 不涨             -> 接收机没在发 / 线接错 / 波特率不对(应 SBUS 100k)
-           CH1/CH2 不是 992 附近 -> 摇杆微调没回中, 或接收机型号不是 HotRc(量程不同, 要重标)
-           CH5/CH6 不是 192/1792 -> 开关通道接错, 或极性宏 RC_*_ACTIVE_HIGH 给反
-           ARM=0 但 CH6 已合闸    -> 上位机把 rc_arm_en 写成 0 了
-           ENG 恒 0             -> CH6 没收/收反, 或 rc_arm_en = 0
-           ENG 恒 3(FAILSAFE)   -> 接收机报失控(ST=0): 先看发射机与接收机对码/供电
-           ENG 恒 4(ESTOP)      -> 急停开关 CH5 在"生效"位置, 或者极性宏给反了
-           ENG=2 但车不动        -> 看 SAFE 位图(SAFE_BIT_LOCAL 没亮 = 本地档位没推上;
-                                    SAFE_BIT_ESTOP=0x80 亮 = 急停还按着) */
+     * FRM 不涨             -> 接收机没在发 / 线接错 / 波特率不对(应 SBUS 100k)
+     * CH1/CH2 不是 992 附近 -> 摇杆微调没回中, 或接收机型号不是 HotRc(量程不同, 要重标)
+     * CH5/CH6 不是 192/1792 -> 开关通道接错, 或极性宏 RC_*_ACTIVE_HIGH 给反
+     * ARM=0 但 CH6 已合闸    -> 上位机把 rc_arm_en 写成 0 了
+     * ENG 恒 0             -> CH6 没收/收反, 或 rc_arm_en = 0
+     * ENG 恒 3(FAILSAFE)   -> 接收机报失控(ST=0): 先看发射机与接收机对码/供电
+     * ENG 恒 4(ESTOP)      -> 急停开关 CH5 在"生效"位置, 或者极性宏给反了
+     * ENG=2 但车不动        -> 看 SAFE 位图(SAFE_BIT_LOCAL 没亮 = 本地档位没推上;
+     * SAFE_BIT_ESTOP=0x80 亮 = 急停还按着)
+     */
     {
         int rt, rf, ra, rd, rs, rsf;
 
@@ -394,14 +368,14 @@ static void motor_print_status (void)
                (unsigned)motor_link_ch_count(),
                (unsigned)motor_link_tx_period_ms());
 
-        /* CH3 / 航向模式一行（2026-10-20 加）：判断"CH3 到底读到没有"只看这一行。
-             c3  = CH3 原始值（0 也可能是**正常的低档**，别急着当掉线）
-             thr = 当前判高低的自适应阈值；cal=1 表示已经见过开关两端
-             mode= HDG(CH1 控航向) / SRV(CH1 控舵机角)
-             off = 当前航向偏移(deg，CH1 给)；ty = 目标航向；yw = 实测航向
-             判读：拨 CH3 时 c3 要跳、mode 要跟着翻；
-                   c3 一动不动     = 这个通道压根没接 / 没映射（去查线或通道分配）
-                   拨了但 mode 不翻 = 量程特殊，把 c3 两头读到的值发我，改标定判据 */
+        /* c3  = CH3 原始值（0 也可能是**正常的低档**，别急着当掉线）
+         * thr = 当前判高低的自适应阈值；cal=1 表示已经见过开关两端
+         * mode= HDG(CH1 控航向) / SRV(CH1 控舵机角)
+         * off = 当前航向偏移(deg，CH1 给)；ty = 目标航向；yw = 实测航向
+         * 判读：拨 CH3 时 c3 要跳、mode 要跟着翻；
+         * c3 一动不动     = 这个通道压根没接 / 没映射（去查线或通道分配）
+         * 拨了但 mode 不翻 = 量程特殊，把 c3 两头读到的值发我，改标定判据
+         */
         printf("        RC3 c3=%u thr=%u cal=%u mode=%s off=%d ty=%d yw=%d\r\n",
                (unsigned)RC_Raw_Ch3,
                (unsigned)RC_Hdg_Thr,
@@ -413,13 +387,14 @@ static void motor_print_status (void)
     }
 
     /* 惯导一行: 航向 / 陀螺Z / 位姿 / 里程 / 状态位 / 零偏 / 静止统计。
-       * 判读顺序(按这个查, 别跳):
-           横幅 imu_init 非 0        -> IMU 没认出来, 先查 P15 接线与型号, **别去调姿态**
-           yaw 静止时一直在走        -> 看 bz(在线零偏)那一列; bz 稳而 yaw 仍走 = dt/符号问题
-           gz 静止时 |值| > 0.2 dps  -> 零偏没收敛, 或 ZUPT 没生效(看 st=)
-           x/y 推车方向不对          -> 查 INS_YAW_SIGN 与编码器 inv_l/inv_r 极性
-           dist 与卷尺差 k 倍        -> 就是 ins_mpm 错, 按"推 2.00 m"重标(见 ins_odom.h)
-           fl 的 bit6(0x40) 亮       -> IMU 通信坏; bit0(0x01) 不亮 = 零偏还没标定完 */
+     * 判读顺序(按这个查, 别跳):
+     * 横幅 imu_init 非 0        -> IMU 没认出来, 先查 P15 接线与型号, **别去调姿态**
+     * yaw 静止时一直在走        -> 看 bz(在线零偏)那一列; bz 稳而 yaw 仍走 = dt/符号问题
+     * gz 静止时 |值| > 0.2 dps  -> 零偏没收敛, 或 ZUPT 没生效(看 st=)
+     * x/y 推车方向不对          -> 查 INS_YAW_SIGN 与编码器 inv_l/inv_r 极性
+     * dist 与卷尺差 k 倍        -> 就是 ins_mpm 错, 按"推 2.00 m"重标(见 ins_odom.h)
+     * fl 的 bit6(0x40) 亮       -> IMU 通信坏; bit0(0x01) 不亮 = 零偏还没标定完
+     */
     {
         int   yr, yf, gr, gf, xr, xf, dr, df, sr, sf, br, bf;
         float bx, by, bz;
@@ -449,47 +424,47 @@ int main (void)
 {
     uint8   ret;
 
-    clock_init(SYSTEM_CLOCK_250M);      // 时钟配置及系统初始化<务必保留>
-    debug_init();                       // 调试串口信息初始化
+    clock_init(SYSTEM_CLOCK_250M);      /* 时钟配置及系统初始化<务必保留> */
+    debug_init();                       /* 调试串口信息初始化 */
 
-    /* 最底层的"我还活着"标记：只要串口参数对，上电第一秒就能看到这一行。
-       把"时钟/引脚/波特率对不对"和"软件逻辑跑没跑"分开，排障时能省很多事。 */
+    /* 最底层的"我还活着"标记：只要串口参数对，上电第一秒就能看到这一行。 把"时钟/引脚/波特率对不对"和"软件逻辑跑没跑"分开，排障时能省很多事。 */
     printf("[##] UART OK  steer + dual motor speed loop (WiFi)\r\n");
 
-    /*----------------------------- 执行器：先钉在 0 -----------------------------*/
+    /* ----------------------------- 执行器：先钉在 0 ----------------------------- */
     motor_drv_init();                   /* 三路 PWM/DIR(左后/右后/转向)都输出 0，且这条路走通了 */
 
-    /*----------------------------- 编码器 -----------------------------*/
+    /* ----------------------------- 编码器 ----------------------------- */
     spd_enc_init();
 
-    /*--------------------- 转向绝对编码器 + 转向位置环 ---------------------
-       转向是"直流电机 + 绝对编码器"(不是会自动回中的 RC 舵机), 必须靠位置环把它按住。
-       引脚按队友的飞线方案: SPI_4(SCB5) CLK P07_2 / MOSI P07_1 / MISO P07_0 / CS P07_3。
-       注意1: steer_abs_init() 里带一次 SPI 自检(最多约 100ms), 失败不会卡住, 只是"角度不可信"。
-       注意2: 默认【全不使能】—— 要动方向盘得先标定(见 01-上电标定卡.md 转向一节),
-              然后上位机把"转向|内环使能"打 1。 */
+    /* --------------------- 转向绝对编码器 + 转向位置环 ---------------------
+     * 转向是"直流电机 + 绝对编码器"(不是会自动回中的 RC 舵机), 必须靠位置环把它按住。
+     * 注意1: steer_abs_init() 里带一次 SPI 自检(最多约 100ms), 失败不会卡住, 只是"角度不可信"。
+     * 注意2: 默认【全不使能】—— 要动方向盘得先标定(见 01-上电标定卡.md 转向一节),
+     * 然后上位机把"转向|内环使能"打 1。
+     */
     steer_abs_init();
     steer_ctrl_init();
 
-    /*----------------------------- 保护与控制器 -----------------------------*/
+    /* ----------------------------- 保护与控制器 ----------------------------- */
     spd_safety_init();                  /* 内部会跑一遍配置自检 */
     spd_ctrl_init();
 
-    /*------------------------------ 协议层（通信统一） ------------------------------
-       ★ 2026-10-20：WiFi / 菜单 / 遥控 三条写入路径统一到 proto_exec()（见 proto.c）。
-         这里只清一次状态；之后主循环每圈调 proto_tick() 检查驱动令牌的租期。
-       [!] 必须放在 remote_ctrl_init() 之前：它会调 proto_estop()（急停的唯一入口）。
-       [!] 不占引脚、不阻塞，纯状态。 */
+    /* ------------------------------ 协议层（通信统一） ------------------------------
+     * 这里只清一次状态；之后主循环每圈调 proto_tick() 检查驱动令牌的租期。
+     * [!] 必须放在 remote_ctrl_init() 之前：它会调 proto_estop()（急停的唯一入口）。
+     * [!] 不占引脚、不阻塞，纯状态。
+     */
     proto_init();
 
-    /*-------------------------- 惯导: IMU + 航位推算 (工程 10 新增) --------------------------
-      [!] ins_imu_init() 是**阻塞**的: 上电陀螺零偏标定采 1000 点 x 5ms = **5 秒**,
-          这 5 秒车必须静止(被碰会判"极差超限"并重来, 最多 5 次 -> 最长约 25 秒)。
-          所以必须放在 pit_ms_init() **之前** —— 开了中断再等, 中断里的 ins_imu_update()
-          会拿着没标定好的零偏开始积分, yaw 从第一拍就是错的。
-      [!] 卡丁的 IMU 从来没初始化过(**工程 9 一次都没调过**): 第一次烧录请盯串口横幅,
-          看它认出的器件 ID。逐飞主板 IMU660RA / IMU660RC / IMU963RA 引脚完全相同
-          (SPI_2 / P15_0~3), 所以"认出来了"这件事本身就要用 ID 证实 —— 963RA 的 0x0F 应为 0x6A。*/
+    /* -------------------------- 惯导: IMU + 航位推算 (工程 10 新增) --------------------------
+     * [!] ins_imu_init() 是**阻塞**的: 上电陀螺零偏标定采 1000 点 x 5ms = **5 秒**,
+     * 这 5 秒车必须静止(被碰会判"极差超限"并重来, 最多 5 次 -> 最长约 25 秒)。
+     * 所以必须放在 pit_ms_init() **之前** —— 开了中断再等, 中断里的 ins_imu_update()
+     * 会拿着没标定好的零偏开始积分, yaw 从第一拍就是错的。
+     * [!] 卡丁的 IMU 从来没初始化过(**工程 9 一次都没调过**): 第一次烧录请盯串口横幅,
+     * 看它认出的器件 ID。逐飞主板 IMU660RA / IMU660RC / IMU963RA 引脚完全相同
+     * (SPI_2 / P15_0~3), 所以"认出来了"这件事本身就要用 ID 证实 —— 963RA 的 0x0F 应为 0x6A。
+     */
     ins_odom_init();
     ret = ins_imu_init();
     {
@@ -506,11 +481,11 @@ int main (void)
                mi, mf);
     }
 
-    /*------------------------ 遥控接收机(UART_4 / P14.0) ------------------------
-       逐飞 UART 接收机(SBUS, 100 kbps, 6 通道)。
-       [!] 必须在 pit_ms_init(PIT_CH2, 5) 之前 —— 它内部要用 TC_TIME2_CH2 做帧间隔计时。
-       [!] 遥控【不依赖 WiFi】: 接管成立时由 remote_ctrl_apply() 调 spd_safety_set_local(1),
-         把保护层那三道"上位机在场"的门换掉。见 remote_ctrl.h。 */
+    /* ------------------------ 遥控接收机(UART_4 / P14.0) ------------------------
+     * 逐飞 UART 接收机(SBUS, 100 kbps, 6 通道)。
+     * [!] 必须在 pit_ms_init(PIT_CH2, 5) 之前 —— 它内部要用 TC_TIME2_CH2 做帧间隔计时。
+     * [!] 遥控【不依赖 WiFi】: 接管成立时由 remote_ctrl_apply() 调 spd_safety_set_local(1),
+     */
     remote_ctrl_init();
 
     if (0 != spd_safety_cfg_bad())
@@ -518,32 +493,34 @@ int main (void)
         printf("[##] CONFIG BAD 0x%02X - motor stays off\r\n", (unsigned)spd_safety_cfg_bad());
     }
 
-    /*------------------------- 5ms 时基：速度环 + 链路 -------------------------*/
+    /* ------------------------- 5ms 时基：速度环 + 链路 ------------------------- */
     /* 参数持久化：从 Work Flash 页 0 读回上次 SAVE 的参数。
-       必须在各模块 init 之后、开 5ms 中断之前 —— 跑起来就是你上次存的增益。
-       [!] 命令/危险量（target / ol_en / ol_duty / steer_en / ins_zero）**不恢复**，
-           上电永远是安全值，见 app_params.c 的 ap_is_cmd()。 */
+     * 必须在各模块 init 之后、开 5ms 中断之前 —— 跑起来就是你上次存的增益。
+     * [!] 命令/危险量（target / ol_en / ol_duty / steer_en / ins_zero）**不恢复**，
+     * 上电永远是安全值，见 app_params.c 的 ap_is_cmd()。
+     */
     app_param_init();
 
     /* 路表：读槽索引 -> 补空槽的内建表 -> 载入 active 槽。
-       [!] 必须在这里（开 5ms 中断之前）：内部会阻塞读 Flash。
-       [!] 内建表只补空槽，且必须在 flash_load 之前（见 ins_route.h 的语义）。 */
+     * [!] 必须在这里（开 5ms 中断之前）：内部会阻塞读 Flash。
+     * [!] 内建表只补空槽，且必须在 flash_load 之前（见 ins_route.h 的语义）。
+     */
     route_app_init();
     route_pb_init();
 
-    /* 12 段跑班：初始化状态（开环一律关掉，不会自己跑）*/
+    /* 12 段跑班：初始化状态（开环一律关掉，不会自己跑） */
     spd_bench_init();
 
     pit_ms_init(PIT_CH2, 5);
     interrupt_global_enable(0);         /* pit0_ch2_isr 里跑 spd_ctrl_tick() */
 
-    /* 先给模块一点上电稳定时间：WiFi 模块刚上电时 SPI 还没准备好，
-       紧接着就 init 容易读到失败（原厂例子是"上电后按键触发"，天然有几秒间隔）。 */
+    /* 先给模块一点上电稳定时间：WiFi 模块刚上电时 SPI 还没准备好， 紧接着就 init 容易读到失败（原厂例子是"上电后按键触发"，天然有几秒间隔）。 */
     system_delay_ms(500);
 
-    /*--------------------------- WiFi-SPI 链路 ---------------------------
-       这个函数会阻塞：WiFi 最长等约 10 秒、Socket 最长等数十秒。
-       失败也不会卡死在这里（返回非 0），主循环照样跑，只是保护层永远不允许出力。 */
+    /* --------------------------- WiFi-SPI 链路 ---------------------------
+     * 这个函数会阻塞：WiFi 最长等约 10 秒、Socket 最长等数十秒。
+     * 失败也不会卡死在这里（返回非 0），主循环照样跑，只是保护层永远不允许出力。
+     */
     ret = motor_link_init();
     if (0 != ret)
     {
@@ -556,20 +533,18 @@ int main (void)
 
     g_print_ms = motor_link_now_ms();
 
-    /*--------------------------- 屏幕 + 按键（菜单） ---------------------------
-       屏幕: 逐飞 IPS200 的 **SPI 版**（硬件 SPI_1），6 根脚由 zf_device_ips200.h 定死：
-             SCL P12_2 / SDA(MOSI) P12_1 / CS P12_3 / RST P22_4 / DC P22_3 / BLK P11_0
-       本工程别的模块**不占**这 6 根：转向绝对编码器走 SPI_4 的 P07_x、
-       WiFi 走 SPI_0 的 P02_x、板载 IMU 走 SPI_2 的 P15_x。改屏幕接线只需改那 6 个宏。
-       按键: 主板自带 4 键 P20_3/P20_2/P20_0/P20_1（K3/K4 已按工程 8 对调）。
-
-       [!] 必须在 motor_link_init() 之后：菜单用 motor_link_now_ms() 做 10 ms 分频，
-           而 key_init(10) 的周期必须与它一致（见 ui_menu.h 头注释）。
-       [!] 屏幕 SPI 是毫秒级开销（清一屏约 40 ms）=> 只能在主循环里画，
-           绝不能放进 5 ms 中断，否则控制节拍直接被顶穿。
-       [!] 这两行**漏了就是全黑屏**（2026-10-17 实际踩到）：ips200_init 不跑，
-           屏幕连背光和复位都不会拉，看起来像"接错线"，其实一行代码都没执行。
-    */
+    /* --------------------------- 屏幕 + 按键（菜单） ---------------------------
+     * 屏幕: 逐飞 IPS200 的 **SPI 版**（硬件 SPI_1），6 根脚由 zf_device_ips200.h 定死：
+     * SCL P12_2 / SDA(MOSI) P12_1 / CS P12_3 / RST P22_4 / DC P22_3 / BLK P11_0
+     * 本工程别的模块**不占**这 6 根：转向绝对编码器走 SPI_4 的 P07_x、
+     * WiFi 走 SPI_0 的 P02_x、板载 IMU 走 SPI_2 的 P15_x。改屏幕接线只需改那 6 个宏。
+     * 按键: 主板自带 4 键 P20_3/P20_2/P20_0/P20_1（K3/K4 已按工程 8 对调）。
+     * [!] 必须在 motor_link_init() 之后：菜单用 motor_link_now_ms() 做 10 ms 分频，
+     * 而 key_init(10) 的周期必须与它一致（见 ui_menu.h 头注释）。
+     * [!] 屏幕 SPI 是毫秒级开销（清一屏约 40 ms）=> 只能在主循环里画，
+     * 绝不能放进 5 ms 中断，否则控制节拍直接被顶穿。
+     * 屏幕连背光和复位都不会拉，看起来像"接错线"，其实一行代码都没执行。
+     */
     ui_init();
     ui_puts_row(0, 0, "Kart10 INS+Route");
     printf("[##] UI init done: IPS200 SPI_1 (SCL P12_2 / SDA P12_1 / CS P12_3 / DC P22_3 / RST P22_4 / BLK P11_0)\r\n");
@@ -577,55 +552,50 @@ int main (void)
 
     while (true)
     {
-        /* 0) ★ 标定档案切换：把参数 tel_sel / tel_period 推给链路层（不用重烧）。
-              tel_sel=0 -> 全量 37 通道；=1 -> 标定精简 16 通道。
-              [!] 通道数一变，帧头 COUNT 跟着变，上位机的档案下拉框要同步切。 */
+        /* tel_sel=0 -> 全量 37 通道；=1 -> 标定精简 16 通道。 [!] 通道数一变，帧头 COUNT 跟着变，上位机的档案下拉框要同步切。 */
         motor_link_set_ch_count((spd_tel_sel > 0.5f) ? MOTOR_CH_COUNT_CALIB : MOTOR_CH_COUNT);
         motor_link_set_tx_period_ms((uint16)spd_tel_period);
 
         /* 1) 链路任务：收上位机命令 + 发遥测。
-              必须在循环里每圈都调到 —— WiFi 的收发都在这里推进，
-              而且要放在任何"可能失败的分支"之外，否则失败路径会把它停掉，
-              表现就是"上位机再也收不到数据"却查不出原因。 */
+         * 必须在循环里每圈都调到 —— WiFi 的收发都在这里推进，
+         * 而且要放在任何"可能失败的分支"之外，否则失败路径会把它停掉，
+         * 表现就是"上位机再也收不到数据"却查不出原因。
+         */
         motor_link_task();
 
-        /* 2) 主循环心跳：给保护层证明"主循环没卡死"。
-              超过 200ms 没心跳，保护层直接把两路输出钉 0。 */
+        /* 2) 主循环心跳：给保护层证明"主循环没卡死"。 超过 200ms 没心跳，保护层直接把两路输出钉 0。 */
         spd_safety_heartbeat();
 
-        /* 2b) ★ 遥控: 读接收机快照 -> 换算 -> 跑接管状态机 -> 写目标 + 推 spd_safety 本地档位。
-               放主循环(不是中断)是刻意的: 它写的 steer_en_cmd / spd_target_* 本来就属于
-               "慢速决策层", 真正的 5ms 控制仍在 pit0_ch2_isr 里。
-               [!] 绝不能把遥控做成 while(1) 页面 —— 那样主循环心跳就断了,
-                 保护层会在 200ms 后把电机全部钉 0(这正是队友那份工程的坑)。 */
+        /* 放主循环(不是中断)是刻意的: 它写的 steer_en_cmd / spd_target_* 本来就属于
+         * "慢速决策层", 真正的 5ms 控制仍在 pit0_ch2_isr 里。
+         * [!] 绝不能把遥控做成 while(1) 页面 —— 那样主循环心跳就断了,
+         */
         remote_ctrl_update();
         remote_ctrl_apply();
 
-        /* 2c) ★ 协议层心跳：检查"驱动令牌"租期。到期就释放（谁消失了，别的设备立刻能接管）；
-              只有链路真的断了才顺手把速度目标清零（稳定巡航时不会自己停车）。
-              [!] 放在 route_pb_poll() 之前：回放要看到本拍最新的 owner 再决定续租/让位。 */
+        /* 只有链路真的断了才顺手把速度目标清零（稳定巡航时不会自己停车）。 [!] 放在 route_pb_poll() 之前：回放要看到本拍最新的 owner 再决定续租/让位。 */
         proto_tick();
 
-        /* ★ 航向测试在 5ms 中断里跑，**不能**从那里碰协议层（会与主循环抢 owner/租期）；
-           它由上位机 ht_mode 授权，所以在这里替它续 SPI 的驱动权 ——
-           "测试内部"上位机可以随便改参数，而菜单/其他设备插不进来。 */
+        /* 它由上位机 ht_mode 授权，所以在这里替它续 SPI 的驱动权 —— "测试内部"上位机可以随便改参数，而菜单/其他设备插不进来。 */
         if (0u != head_test_active()) { (void)proto_drv_acquire(PROTO_SRC_SPI); }
 
         /* 2d) 工程 10 新增：12 段跑班收尾 + 日志落盘 + 屏幕菜单。
-               放在心跳之后：菜单刷屏最差 ~40 ms，不能把心跳饿死（200 ms 门）。
-               bench_log_poll() 每圈**最多写一页 Flash**，不长阻塞。 */
+         * 放在心跳之后：菜单刷屏最差 ~40 ms，不能把心跳饿死（200 ms 门）。
+         * bench_log_poll() 每圈**最多写一页 Flash**，不长阻塞。
+         */
         spd_bench_poll();
         bench_log_poll();
         route_app_poll();       /* 路表: 录制采样 + 串口灌表 + 每圈一页落盘 */
-        route_pb_poll();        /* 路表: 回放状态机（不给速度时只算目标航向）*/
+        route_pb_poll();        /* 路表: 回放状态机（不给速度时只算目标航向） */
         ui_menu_task();
 
         /* 2c) 惯导的慢动作: 位姿归零 + IMU 掉线重试。
-               放主循环的理由与遥控一样 —— 它们是"慢速决策", 不是 5ms 控制。
-               [!] 归零必须【位姿 + 航向】一起归: 只归一个, 后面所有相对量(路表/回放)
-                  就整体错位了, 而且**看着仍然像一条轨迹**。
-               [!] IMU 重试只在链路坏时做: 那时中断里的 ins_imu_update() 不碰 SPI_2,
-                  主循环里重新 init 才没有竞争(ins_imu_try_recover 内部就是这么判的)。 */
+         * 放主循环的理由与遥控一样 —— 它们是"慢速决策", 不是 5ms 控制。
+         * [!] 归零必须【位姿 + 航向】一起归: 只归一个, 后面所有相对量(路表/回放)
+         * 就整体错位了, 而且**看着仍然像一条轨迹**。
+         * [!] IMU 重试只在链路坏时做: 那时中断里的 ins_imu_update() 不碰 SPI_2,
+         * 主循环里重新 init 才没有竞争(ins_imu_try_recover 内部就是这么判的)。
+         */
         {
             uint8 nz = (ins_zero_cmd > 0.5f) ? 1u : 0u;
 
@@ -649,9 +619,10 @@ int main (void)
         }
 
         /* 3) 转向环已挪到 pit0_ch2_isr(5ms 中断)里跑, 见 cm7_0_isr.c —— 这里不再调用。
-              挪走的理由: 主循环周期被 WiFi 收发拖成几毫秒的抖动, 而目标斜坡(度/秒)
-              与误差死区都依赖真实周期; 放中断才能保证严格 5ms。
-              千万别两处都调, 否则同一拍跑两遍, 斜坡会走两倍速。 */
+         * 挪走的理由: 主循环周期被 WiFi 收发拖成几毫秒的抖动, 而目标斜坡(度/秒)
+         * 与误差死区都依赖真实周期; 放中断才能保证严格 5ms。
+         * 千万别两处都调, 否则同一拍跑两遍, 斜坡会走两倍速。
+         */
 
         /* 4) 填遥测 + 打印状态 */
         motor_fill_telemetry();

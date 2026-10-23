@@ -1,6 +1,4 @@
-/*********************************************************************************************************************
- * 工程 10（卡丁）· 路表应用层实现（设计意图见 route_app.h）
- ********************************************************************************************************************/
+/* 工程 10（卡丁）· 路表应用层实现（设计意图见 route_app.h） */
 #include "zf_common_headfile.h"
 #include <stdio.h>
 #include <string.h>
@@ -8,7 +6,7 @@
 #include "ins_route.h"
 #include "route_link.h"
 #include "route_app.h"
-#include "route_pb.h"      /* ★ 回放状态：rt_st 的 PLAY 位（2026-10-21 补上，以前这个位永远是 0）*/
+#include "route_pb.h"
 
 /* ---- 命令量（绑定到参数表 ID 38/40/41/42/53）---- */
 volatile float rt_rec_cmd  = 0.0f;
@@ -17,6 +15,8 @@ volatile float rt_load_cmd = 0.0f;
 volatile float rt_save_cmd = 0.0f;
 volatile float rt_mark_cmd = 0.0f;
 
+volatile float rt_hmode    = 0.0f;
+
 /* ---- 边沿记忆 ---- */
 static uint8   s_rec_last   = 0u;
 static uint8   s_load_last  = 0u;
@@ -24,9 +24,7 @@ static uint8   s_save_last  = 0u;
 static uint8   s_mark_last  = 0u;
 static uint8   s_slot_last  = 0xFFu;    /* 0xFF = 还没同步过 */
 
-/*===================================================================================================================
- *  一、上电
- *=================================================================================================================*/
+/* 一、上电 */
 void route_app_init (void)
 {
     uint32  i;
@@ -34,15 +32,13 @@ void route_app_init (void)
 
     ins_route_init();                   /* 清 RAM 缓冲 + 夹点距 */
 
-    /* ① 先读槽索引（决定 active 槽）
-       ⚠ 顺序硬约束：内建表 → 载入 active。反了会把用户的表盖掉（见 ins_route.h）。 */
+    /* ① 先读槽索引（决定 active 槽） */
     ins_route_slot_init();
 
     /* ② 串口灌表的链路：只清接收环形缓冲/状态，UART 本身早就由 debug_init 起来了 */
     route_link_init();
 
-    /* ③ 内建表：**只往空槽里补**（本工程目前是空注册表，见 ins_route_builtin.c）
-          ⚠ 还在 5 ms 中断打开之前 ⇒ 这里可以死等写盘完成；限圈数防挂死。 */
+    /* ③ 内建表：**只往空槽里补**（本工程目前是空注册表，见 ins_route_builtin.c） */
 #if (1 == INS_ROUTE_BUILTIN_EN)
     for (i = 0u; i < ins_route_builtin_cnt; i ++)
     {
@@ -91,9 +87,7 @@ void route_app_init (void)
     rt_slot_cmd = (float)s_slot_last;
 }
 
-/*===================================================================================================================
- *  二、主循环
- *=================================================================================================================*/
+/* 二、主循环 */
 void route_app_poll (void)
 {
     uint8 now;
@@ -137,8 +131,7 @@ void route_app_poll (void)
         }
     }
 
-    /* ---- 2) 选槽：改了目标槽就切 active（持久化）+ 载入 ----
-       ⚠ 这一步**会覆盖 RAM 里没存盘的录制结果**，所以录制中不允许切槽。 */
+    /* ---- 2) 选槽：改了目标槽就切 active（持久化）+ 载入 ---- */
     slot = (uint8)(rt_slot_cmd + 0.5f);
     if (slot >= (uint8)INS_RT_SLOT_COUNT) { slot = 0u; }
 
@@ -183,8 +176,7 @@ void route_app_poll (void)
     }
     s_save_last = now;
 
-    /* ---- 4b) 打关键点（0→1）：给"最后一个已录点"打标（手工方案用）----
-       ⚠ 只标点、不做任何 IO ⇒ 遥控器/按键/上位机三种触发方式都能走这一个入口。 */
+    /* ---- 4b) 打关键点（0→1）：给"最后一个已录点"打标（手工方案用）---- */
     now = (rt_mark_cmd > 0.5f) ? 1u : 0u;
     if ((0u != now) && (0u == s_mark_last))
     {
@@ -197,9 +189,10 @@ void route_app_poll (void)
     s_mark_last = now;
 
     /* ---- 5) 三块模块的轮询 ----
-       · `ins_route_poll()` 录制采样（按距离触发，主循环级节拍就够）
-       · `route_link_poll()` 串口灌表（顺序同工程 8：它靠 flash_busy 判完成）
-       · `ins_route_flash_poll()` 每圈最多写一页，空闲立刻返回 */
+     * · `ins_route_poll()` 录制采样（按距离触发，主循环级节拍就够）
+     * · `route_link_poll()` 串口灌表（顺序同工程 8：它靠 flash_busy 判完成）
+     * · `ins_route_flash_poll()` 每圈最多写一页，空闲立刻返回
+     */
     ins_route_poll();
     route_link_poll();
     ins_route_flash_poll();
@@ -230,9 +223,7 @@ uint8 route_app_slot_next (void)
     return ins_route_slot_active();
 }
 
-/*===================================================================================================================
- *  三、对外状态
- *=================================================================================================================*/
+/* 三、对外状态 */
 uint16 route_app_count (void)
 {
     return ins_route_get_count();
@@ -250,9 +241,9 @@ uint16 route_app_status (void)
     if (0u != ins_route_flash_loaded())                     { st |= RT_ST_FROMFLSH; }
     if (0u != route_link_active())                          { st |= RT_ST_LINK;     }
 
-    /* ★ 2026-10-21：这个位**以前根本没人置**（RT_ST_PLAY 定义了但没写）⇒ 遥测/CSV 里
-       "回放中"是看不出来的：17:25 那份记录里 pb 明明在跑（满舵 + pb_elat=38 m），
-       rt_st 却一直是 68(HAVE|FROMFLSH)，排查时被误导了一大圈。 */
+    /* "回放中"是看不出来的：17:25 那份记录里 pb 明明在跑（满舵 + pb_elat=38 m），
+     * rt_st 却一直是 68(HAVE|FROMFLSH)，排查时被误导了一大圈。
+     */
     if (0u != route_pb_active())                            { st |= RT_ST_PLAY;     }
 
     rc = ins_route_flash_last_rc();

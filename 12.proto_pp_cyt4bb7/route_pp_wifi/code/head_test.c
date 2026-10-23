@@ -1,6 +1,4 @@
-/*********************************************************************************************************************
- * 工程 11 · 航向测试实现（设计说明见 head_test.h）
- ********************************************************************************************************************/
+/* 工程 11 · 航向测试实现（设计说明见 head_test.h） */
 #include "zf_common_headfile.h"
 #include <math.h>
 #include <stdio.h>
@@ -12,12 +10,10 @@
 #include "route_pb.h"
 #include "motor_link.h"          /* motor_link_online()：链路在线判据 */
 #include "spd_safety.h"          /* spd_safety_estop()：急停必须中止测试 */
-#include "proto.h"               /* ★ 驱动令牌：ht_mode 是谁写的，谁就是驾驶员 */
+#include "proto.h"
 #include "head_test.h"
 
-/*===================================================================================================================
- *  参数（ID 69~75）
- *=================================================================================================================*/
+/* 参数（ID 69~75） */
 volatile float ht_mode  = 0.0f;
 volatile float ht_rps   = 1.20f;
 volatile float ht_yaw   = 0.0f;
@@ -26,17 +22,14 @@ volatile float ht_step  = 5.00f;
 volatile float ht_n     = 8.00f;
 volatile float ht_k     = 2.00f;
 
-/*===================================================================================================================
- *  状态
- *=================================================================================================================*/
 static uint8   s_on    = 0u;
 static uint8   s_head  = 0u;            /* 航向外环是否由本模块打开 */
 static uint8   s_mode  = 0u;
 static uint16  s_seg   = 0u;            /* 1..n，0 = 没在跑 */
 static float   s_seg_view = HT_SEG_OFF; /* 遥测用：跑完保留 254 */
 static uint32  s_ticks = 0u;            /* 段内 5 ms 计数 */
-static float   s_yaw0  = 0.0f;          /* 起步航向（所有目标都相对它）*/
-static float   s_tar   = 0.0f;          /* 本拍目标航向（绝对，deg）*/
+static float   s_yaw0  = 0.0f;          /* 起步航向（所有目标都相对它） */
+static float   s_tar   = 0.0f;          /* 本拍目标航向（绝对，deg） */
 static float   s_err   = 0.0f;
 static uint8   s_rise  = 0u;            /* 本段是否已经进过 ±1° */
 static uint32  s_rise_ms = 0u;
@@ -45,14 +38,23 @@ static uint32  s_print = 0u;            /* 模式①的 1 s 打印节拍 */
 
 static float ht_wrap180 (float a)
 {
-    while (a >  180.0f) { a -= 360.0f; }
-    while (a < -180.0f) { a += 360.0f; }
+    /* （上游任何一个量炸了：未初始化的 target_yaw、除零、NaN 之后的溢出…），
+     * `-= 360` 永远退不出来 => 这个函数所在的 1 kHz ISR / 主循环就地卡死 =>
+     * 菜单冻结、按键无效、WiFi·SPI 停发（TX 灯灭 / RX 被从机拉常亮）、电机不动。
+     * 加次数上限 + NaN 保护：病态输入只会被夹到 +-180，绝不会再卡住。
+     */
+    uint8 guard = 0u;
+
+    if (!(a == a))                                     { return 0.0f; }
+    while ((a >  180.0f) && (guard < 64u)) { a -= 360.0f; guard ++; }
+    guard = 0u;
+    while ((a < -180.0f) && (guard < 64u)) { a += 360.0f; guard ++; }
+    if (a >  180.0f) { a =  180.0f; }                /* 超过 64 圈 => 数值已病态，直接夹住 */
+    if (a < -180.0f) { a = -180.0f; }
     return a;
 }
 
-/*===================================================================================================================
- *  起 / 停
- *=================================================================================================================*/
+/* 起 / 停 */
 static void ht_stop (const char *why)
 {
     if (0u != s_head)
@@ -60,7 +62,6 @@ static void ht_stop (const char *why)
         steer_ctrl_set_head_enable(0u);
         s_head = 0u;
     }
-    /* ★ 先对齐转角，再清速度：反过来做，退出那一刻方向盘会甩一下 */
     steer_ctrl_set_target_delta(steer_ctrl_get_meas_delta());
     spd_target_l = 0.0f;
     spd_target_r = 0.0f;
@@ -120,9 +121,7 @@ static void ht_begin (uint8 mode)
            (unsigned)ht_dwell, (unsigned)((ht_dwell - (float)(unsigned)ht_dwell) * 100.0f));
 }
 
-/*===================================================================================================================
- *  5 ms 节拍
- *=================================================================================================================*/
+/* 5 ms 节拍 */
 void head_test_tick (void)
 {
     uint8 mode = (uint8)(ht_mode + 0.5f);
@@ -144,8 +143,7 @@ void head_test_tick (void)
         if (!motor_link_online()) { return; }
         if (ins_odom_enable < 0.5f) { return; }
 
-        /* ★ 驱动权必须在上位机手里：ht_mode 是 P_CMD，写它的那个来源就是令牌持有者。
-           没有令牌就不起 —— 否则会出现"遥控在开车、航向测试同时往 spd_target_* 写 rps"。 */
+        /* 没有令牌就不起 —— 否则会出现"遥控在开车、航向测试同时往 spd_target_* 写 rps"。 */
         if (proto_drv_owner() != PROTO_SRC_SPI) { return; }
 
         ht_begin(mode);
@@ -180,16 +178,11 @@ void head_test_tick (void)
     s_err = ht_wrap180(s_tar - o.yaw);
 
     /* ---- 4) 下发：航向外环 + 恒定后轮 rps（**带电子差速**）----
-     *
-     *  ★★ 2026-10-21：原来这里是 `spd_target_l = spd_target_r = ht_rps`，即**不给差速**。
-     *     后果（实测）：转弯时内轮被外轮拖着走 ⇒ 内轮编码器**多读** ⇒
-     *       · `(v_r − v_l)` 偏小 ⇒ "陀螺 / 轮速差" 算出来 1.27（看着像 yaw 刻度错，其实不是）；
-     *       · 航向测试自己给的 rps 与真实地面速度不一致 ⇒ 上升时间/超调都不可比；
-     *       · 内轮拖地还会让车**欠转**（同样的 δ 转不到理论半径）。
-     *     ⇒ 换成与遥控/回放**完全同一条律**（见 `工程10-控制层-航向追随与电子差速.md`）：
-     *         κ = tan(实测δ)/L，v_l,r = v(1 ∓ κ·W/2)；平均仍是 v，所以里程口径不变。
-     *     ⚠ 用**实测**舵角，不用目标角：目标角会让后轮在舵机到位之前就提前差速。
-     *     ⚠ 单位：`spd_target_*` 是 rps，而 `spd_diff_alloc` 吃 m/s ⇒ 进乘 m_per_rev、出去除回去。
+     * · `(v_r − v_l)` 偏小 ⇒ "陀螺 / 轮速差" 算出来 1.27（看着像 yaw 刻度错，其实不是）；
+     * · 航向测试自己给的 rps 与真实地面速度不一致 ⇒ 上升时间/超调都不可比；
+     * · 内轮拖地还会让车**欠转**（同样的 δ 转不到理论半径）。
+     * ⇒ 换成与遥控/回放**完全同一条律**（见 `工程10-控制层-航向追随与电子差速.md`）：
+     * κ = tan(实测δ)/L，v_l,r = v(1 ∓ κ·W/2)；平均仍是 v，所以里程口径不变。
      */
     steer_ctrl_set_head_kp(ht_k);
     steer_ctrl_set_target_yaw(s_tar);
@@ -216,10 +209,7 @@ void head_test_tick (void)
     /* ---- 6) 段推进 / 打印 ---- */
     if ((uint8)HT_MODE_FIXED == s_mode)
     {
-        /* ★ 2026-10-21：模式① 也按 `ht_dwell` **自动停**。
-           原来只有台阶模式用它，于是 App 上"时长 s 15"对固定航向是个**摆设**：
-           填 15 实际要么一直跑、要么被安全门提前掐掉，现场只看到"怎么才几秒"。
-           现在时长到点就收：停车 + ht_mode 归 0（App 那边也跟着变成"没在跑"）。 */
+        /* 填 15 实际要么一直跑、要么被安全门提前掐掉，现场只看到"怎么才几秒"。 现在时长到点就收：停车 + ht_mode 归 0（App 那边也跟着变成"没在跑"）。 */
         if ((ht_dwell >= 0.5f) && (s_ticks >= (uint32)(ht_dwell * 200.0f)))
         {
             printf("[HT] 固定航向到时长 %u s，停 (yaw=%d.%01d err=%d.%01d)\r\n",
@@ -275,9 +265,7 @@ void head_test_tick (void)
     }
 }
 
-/*===================================================================================================================
- *  读出（遥测用）
- *=================================================================================================================*/
+/* 读出（遥测用） */
 void  head_test_init   (void) { s_on = 0u; s_seg = 0u; s_seg_view = HT_SEG_OFF; s_head = 0u; }
 uint8 head_test_active (void) { return s_on; }
 float head_test_tar_yaw(void) { return s_tar; }
