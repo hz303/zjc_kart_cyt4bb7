@@ -113,7 +113,7 @@ static const um_item_t UM_ITEMS[] =
        空槽/正在跟随/正在录制/正在落盘 一律拒绝，并把原因写在标题行。 */
     { "6.Slot",        UM_SLOT,  0,           0u  },
     { "7.Follow",      UM_MODE,  0,           0u  },   /* pb_mode：1=PUSH 2=PWR */
-    { "8.Speed",       UM_RPS,   0,           0u  },   /* 0.8/1.2/2.4 rps 三档 */
+    { "8.Speed",       UM_RPS,   0,           0u  },   /* 0.8/1.2/2.4/3.0 rps 四档 */
     { "9.Save Par",    UM_ACT,   act_psave,   0u  },   /* ★ 写 Flash 页 0 */
     { "10.Reset",      UM_ACT,   act_reset,   0u  },   /* 参数恢复默认（只写 RAM）*/
 };
@@ -126,7 +126,7 @@ static const um_item_t UM_ITEMS[] =
 /* ★ 2026-10-21：0.8~3.0 连续可调 → **3 档基准速度**（用户口径 rps）。
    现场只有"慢 / 中 / 快"三档要选；连续 0.1 步长在 4 键屏上要按十几次，
    还容易停在 1.199999 这种数上。档位表就在这里，改档 = 查表。 */
-static const float UM_PWR_GEAR[] = { 0.8f, 1.2f, 2.4f };
+static const float UM_PWR_GEAR[] = { 0.8f, 1.2f, 2.4f, 3.0f };
 #define UM_PWR_NGEAR    ((uint8)(sizeof(UM_PWR_GEAR) / sizeof(UM_PWR_GEAR[0])))
 
 /* 把一个 rps 值吸到最近的档位（参数被 App/上位机改成别的值时也不会显示成怪数） */
@@ -658,8 +658,28 @@ static void um_draw_edit(void)
         }
         else
         {
-            um_puts(3u, 0u, (v < 0.5f) ? "= OFF  (pb_en=0)"
-                         : ((v > 1.5f) ? "= PWR  (steer+speed)" : "= PUSH (steer only)"));
+            /* ★ 2026-10-22：OFF 时也要说"上一次为什么退出"。
+               以前只写 "= OFF (pb_en=0)"，于是"切 PUSH 一闪就回 OFF"完全没线索；
+               现在会把 route_pb 记下的原因贴在后面（done: finish / ESTOP /
+               drv preempted / RC ON: CH6->OFF …），一眼能分是"跑完了"还是"被挡了"。 */
+            if (v < 0.5f)
+            {
+                const char *rr = route_pb_reason();
+
+                if ((NULL != rr) && (0 != rr[0]))
+                {
+                    snprintf(line, sizeof(line), "= OFF: %.13s", rr);
+                    um_puts(3u, 0u, line);
+                }
+                else
+                {
+                    um_puts(3u, 0u, "= OFF  (pb_en=0)");
+                }
+            }
+            else
+            {
+                um_puts(3u, 0u, (v > 1.5f) ? "= PWR  (steer+speed)" : "= PUSH (steer only)");
+            }
         }
     }
     else if (UM_RPS == it->kind)
@@ -687,8 +707,12 @@ static void um_draw_edit(void)
            en = pb_en 实际值；st = 回放状态(0空闲 1跑 2完成 3中止)；
            coast = 自由轮是否生效（1 = 两后轮 0 占空比，推得动）。
            step/min/max 对一个 0~2 的三态开关没有意义，直接让位给诊断。 */
-        snprintf(line, sizeof(line), "en=%u st=%u",
-                 (unsigned)((pb_en > 0.5f) ? 1u : 0u), (unsigned)route_pb_state());
+        /* rc = RC_Engage：0 OFF / 1 STANDBY / 2 ON / 3 FAILSAFE / 4 ESTOP。
+           ★ 2026-10-22 加：PWR 被安全门挡住时（最常见＝接收机没插，rc 恒 3），
+             这一位能一眼看出来，不用再猜"为什么 PWR 一直 WAIT"。 */
+        snprintf(line, sizeof(line), "en=%u st=%u rc=%u",
+                 (unsigned)((pb_en > 0.5f) ? 1u : 0u), (unsigned)route_pb_state(),
+                 (unsigned)RC_Engage);
         um_puts(4u, 0u, line);
 
         /* ★ 2026-10-21：第 5 行给"跑到哪了"，比 coast 有用得多 ——

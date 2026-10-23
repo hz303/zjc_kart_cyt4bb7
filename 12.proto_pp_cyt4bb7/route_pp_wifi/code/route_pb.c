@@ -17,6 +17,7 @@
 #include "route_pb.h"
 #include "head_test.h"
 #include "proto.h"              /* ★ 驱动令牌：回放是"启动它的那个来源"的子模式 */
+#include "motor_link.h"         /* ★ motor_link_online()：手机/上位机链路是否在（PWR 放行判据） */
 
 #define PB_D2R      (0.01745329252f)
 #define PB_R2D      (57.29577951f)
@@ -48,6 +49,7 @@ volatile float pb_fin     = 0.15f;              /* 68 ★ 终点判定半径 m *
  *=================================================================================================================*/
 static uint8   s_st    = PB_ST_IDLE;
 static uint8   s_arm   = 0u;            /* pb_en 的上一拍，用来抓 0→1 上升沿 */
+static uint8   s_done_armed = 0u;       /* 1 = 已走过完成阈值点，才允许判"到终点" */
 static uint16  s_idx   = 0u;            /* 最近点（单调，不后退）*/
 static uint16  s_aim   = 0u;            /* 前视点 */
 static uint16  s_n     = 0u;            /* 开跑时快照的点数 */
@@ -78,6 +80,14 @@ static uint8   s_rev = 0u;
 /* 急停连续计数（去抖用，见 poll 里的急停门） */
 static uint16  s_estop_ticks = 0u;
 
+/* ★ 2026-10-22 终点停车斜坡：完成判据命中后不立刻把 target 置 0，
+   而是把"命中那一拍的左右目标"快照下来，用 PB_STOP_MS 毫秒线性降到 0。
+   0 = 没有在斜坡中。单位同 spd_target_*（rps）。 */
+static uint8   s_ramp    = 0u;    /* 1 = 正在走停车斜坡 */
+static uint32  s_ramp_t0 = 0u;    /* 斜坡起始时刻 ms（motor_link_now_ms） */
+static float   s_ramp_l  = 0.0f;
+static float   s_ramp_r  = 0.0f;
+
 /*===================================================================================================================
  *  一、工具
  *=================================================================================================================*/
@@ -107,7 +117,7 @@ static float pb_dist (const ins_wp_t *a, const ins_wp_t *b)
  *
  *  与 Polaris `kart_playback_build_profile` 同构，按我们的表改两处：
  *    · 窗口点数走参数 `pb_kwin`（它写死 PLAYBACK_KAPPA_WIN = 8）
- *    · 末尾 PB_END_SLOW_M 内线性收油（它靠 mission 的完成判据 + 主动刹停）
+ *    · 末尾由"末点锚 PB_END_CREEP + 反向刹车"生成减速曲线（它靠 mission 的完成判据刹停）
  *=================================================================================================================*/
 static void pb_build_profile (uint16 n)
 {
@@ -178,6 +188,31 @@ static void pb_build_profile (uint16 n)
         if ((s_vlim[i] < 0.0f) && (s_vlim[i - 1u] > 0.0f)) { s_vlim[i - 1u] = (float)PB_REV_CREEP; }
     }
 
+    /* ---- ①c 末点锚"爬行速度"（2026-10-22，替代原来的"末段 1 m 线性收油"）----
+       只改**最后一个前进点**的速度，剩下的减速曲线由下面 ② 的反向刹车
+       `v[i-1] ≤ sqrt(v[i]² + 2·abrk·ds)` 自动算出来 ——
+       那正是"以 pb_abrk 刹住所需的最快速度"，所以连续、无台阶、也不会超过 pb_abrk。
+       ⚠ 原来是把最后 1 m 收油到 pb_vmin，而且 `r = 1 - back/1m` 里 back 是从末点往前累加的
+         ⇒ **方向反了**：末点保持全速、末点前 1 m 压到 0.24 rps、1 m 外又跳回 1.7 rps，
+         在 L−1.0 m 处形成 13.3 m/s² 的减速度尖峰（abrk 的 16 倍）= 现场那"一顿"。
+         另外 pb_vmin=0.2 m/s 落在电机死区，爬行段会一走一停。
+       ⚠ creep 必须 ≥ vmin ≤ vmax，且只在前进段（倒车段是照抄的负速，不能锚正数）。 */
+    {
+        float creep = (float)PB_END_CREEP;
+
+        if (creep < vmin) { creep = vmin; }
+        if (creep > vmax) { creep = vmax; }
+
+        for (i = (uint16)(n - 1u); i > 0u; i --)
+        {
+            if (s_vlim[i] >= 0.0f)
+            {
+                if (s_vlim[i] > creep) { s_vlim[i] = creep; }
+                break;
+            }
+        }
+    }
+
     /* ---- ② 反向传刹车：弯心低速往前传 ⇒ 入弯前就减到位 ----
        ⚠ 换向点两侧**不互传**：倒车段的负速和前进段的正速不是同一条刹车链，
           不跳过的话 lim 会算成负数，把前进段整段压死。 */
@@ -200,30 +235,6 @@ static void pb_build_profile (uint16 n)
         if ((s_vlim[i] >= 0.0f) && (s_vlim[i] < vmin)) { s_vlim[i] = vmin; }
     }
 
-    /* ---- ④ 末段收油：最后 PB_END_SLOW_M 米线性降到 **vmin** ----
-       ⚠ 与 Polaris 的**有意差异**：Polaris 把最后一点锚 0，靠 pb_fin(0.15 m) 圈收车；
-          我们收到 0 会死锁（停在圈外、目标恒 0、判据永不触发），所以收到 vmin。
-       ⚠ 必须在差速分配之前缩掉，否则两侧同比例缩放、平均速度不降。
-       ⚠ 倒车段跳过（负速是照抄的，不能被缩放）。 */
-    {
-        const ins_wp_t *q = ins_route_get_points();
-        float back = 0.0f;
-        uint16 k;
-
-        for (k = (uint16)(n - 1u); k > 0u; k --)
-        {
-            if (back < PB_END_SLOW_M)
-            {
-                if (s_vlim[k] >= 0.0f)
-                {
-                    float r = 1.0f - (back / PB_END_SLOW_M);
-
-                    s_vlim[k] = vmin + (s_vlim[k] - vmin) * r;
-                }
-            }
-            back += pb_dist(&q[k - 1u], &q[k]);
-        }
-    }
 }
 
 /*===================================================================================================================
@@ -317,6 +328,7 @@ static void pb_finish (uint8 st, const char *why)
         }
 
         pb_release_steer();
+        s_ramp = 0u;                    /* ★ 被急停/抢占打断时，别把斜坡带到下一次起跑 */
         spd_ctrl_set_coast(0u);         /* ★ 退出时务必撤自由轮，否则遥控/跑班也推不动 */
 
         /* ★ 交还本地授权（只在**是我们拿的**、且遥控没有同时在驱动时才真的撤）。
@@ -412,6 +424,9 @@ static uint8 pb_start (void)
 
     /* ★ 记下"谁授权了这次回放"：pb_en 是 P_CMD，写它的那个来源此刻就是令牌持有者。
        回放全程占着这个令牌（每拍续租），跑完在 pb_finish 里释放。 */
+    s_done_armed = 0u;              /* ★ 新起跑：重新计算"走过没有" */
+    s_ramp       = 0u;              /* ★ 新起跑：清掉可能残留的停车斜坡 */
+
     s_drv = proto_drv_owner();
     if (PROTO_SRC_NONE == s_drv)
     {
@@ -434,6 +449,8 @@ void route_pb_init (void)
 {
     s_st   = PB_ST_IDLE;
     s_arm  = 0u;
+    s_done_armed = 0u;
+    s_ramp = 0u;
     s_idx  = 0u;
     s_n    = 0u;
     s_elat = 0.0f;
@@ -463,6 +480,7 @@ void route_pb_poll (void)
         /* 航向测试（App 的测试页）优先：它也在写 target_yaw / spd_target_*，
            两边同时跑就是"两个源抢同一个执行器"。让位方必须是回放 —— 测试是人手按下的短时实验。 */
         if (PB_ST_RUN == s_st) { pb_finish(PB_ST_IDLE, "head test busy"); }
+        else                   { pb_set_why("ht busy"); }   /* 没在跑也要说原因，否则屏幕只剩 WAIT */
         s_arm = 0u;
         return;
     }
@@ -478,9 +496,19 @@ void route_pb_poll (void)
        blocked PUSH as well -> the servo never followed AND the speed loop held
        target=0 (car could not be pushed), with no error shown anywhere.
        PUSH drives no motor (a human pushes), so it must not require a live RC.
-       ON = someone is actually driving by RC -> yield; ESTOP = always highest. */
+       ON = someone is actually driving by RC -> yield; ESTOP = always highest.
+       2026-10-22: FAILSAFE 只挡"既没接收机、链路也不在"的 PWR —— 手机/上位机
+       在线时（能按急停）允许 PWR，见下面的判据。 */
+    /* ★★★ 2026-10-22：FAILSAFE 挡 PWR 的条件再加一个"没有别的接管手段"。
+       现场常态是**不插接收机**（遥控不开），靠手机/上位机走 WiFi·SPI 看着车 ——
+       手机上有急停，一样能停住。原来只要 `RC_Engage==FAILSAFE` 就把 PWR 挡死，
+       于是"遥控没开 ⇒ PWR 永远 WAIT"，可 PUSH 又能跑（因为 PUSH 不需要这条），
+       看上去像"PWR 坏了"。
+       ⇒ 判据改成：FAILSAFE + PWR + **链路也不在** 才挡。
+          `motor_link_online()` 自带超时（spd_lost_ms），手机一断线立刻恢复保护。 */
     if ((RC_ENGAGE_ON == RC_Engage) || (RC_ENGAGE_ESTOP == RC_Engage) ||
-        ((RC_ENGAGE_FAILSAFE == RC_Engage) && (pb_mode >= 1.5f)))
+        ((RC_ENGAGE_FAILSAFE == RC_Engage) && (pb_mode >= 1.5f) &&
+         (0u == motor_link_online())))
     {
         if (PB_ST_RUN == s_st) { pb_finish(PB_ST_IDLE, "RC ON/ESTOP"); }
         /* ★ 2026-10-21：**每一次都写原因**，并且把"怎么解除"写在字串里。
@@ -491,7 +519,8 @@ void route_pb_poll (void)
                                  否则就是"切 PWR 电机根本不转"却一点线索都没有。 */
         if (RC_ENGAGE_ESTOP == RC_Engage)      { pb_set_why("ESTOP latch"); }
         else if (RC_ENGAGE_ON == RC_Engage)    { pb_set_why("RC ON: CH6->OFF"); }
-        else                                   { pb_set_why("RC lost: PWR blk"); }
+        /* 只有"既没接收机、又没链路"才走到这里（链路在线时上面的门不会进） */
+        else                                   { pb_set_why("no RC & no link"); }
         s_arm = 0u;
         return;
     }
@@ -507,6 +536,7 @@ void route_pb_poll (void)
         if (s_estop_ticks >= (uint16)PB_ESTOP_TICKS)
         {
             if (PB_ST_RUN == s_st) { pb_finish(PB_ST_ABORT, "ESTOP"); pb_en = 0.0f; }
+            else                   { pb_set_why("ESTOP latch"); }
             s_arm = 0u;
             return;
         }
@@ -518,7 +548,41 @@ void route_pb_poll (void)
     if (ins_odom_enable < 0.5f)
     {
         if (PB_ST_RUN == s_st) { pb_finish(PB_ST_IDLE, "odom off"); }
+        else                   { pb_set_why("odom off"); }
         s_arm = 0u;
+        return;
+    }
+
+    /* ---- 1a2) 终点停车斜坡（2026-10-22）----
+       放在**所有安全门之后**：斜坡期间急停/遥控抢占照样能进来把它打断。
+       期间还占着驱动权与本地授权（车还在受控地减速），走完再 pb_finish 交还。
+       ⚠ 不写舵机目标 ⇒ 保持最后那个舵角（末段是直的/缓弯，不需要再修正）。 */
+    if (0u != s_ramp)
+    {
+        uint32 el = (uint32)(motor_link_now_ms() - s_ramp_t0);
+        float  k;
+
+        if (pb_mode < 1.5f)
+        {
+            /* 中途切 PUSH（人推）：立刻放手，别继续给力 */
+            s_ramp = 0u;
+            pb_finish(PB_ST_DONE, "done: finish");
+            pb_en = 0.0f;
+            return;
+        }
+        if (el >= (uint32)PB_STOP_MS)
+        {
+            s_ramp = 0u;
+            spd_target_l = 0.0f;
+            spd_target_r = 0.0f;
+            pb_finish(PB_ST_DONE, "done: finish");
+            pb_en = 0.0f;
+            return;
+        }
+
+        k = 1.0f - ((float)el / (float)PB_STOP_MS);
+        spd_target_l = s_ramp_l * k;
+        spd_target_r = s_ramp_r * k;
         return;
     }
 
@@ -585,6 +649,22 @@ void route_pb_poll (void)
     best  = pb_find_nearest(px, py, p);
     s_idx = best;
 
+    /* ★★★ 2026-10-22 "闭合表起跑即完成"保护。
+       8 字表首尾只差 74 mm，而完成判据是"离末点 < pb_fin(0.15 m)"
+       ⇒ 车停得准的时候（离起点 <0.15 m），**起跑第一拍就判 DONE**：
+          pb_finish(DONE) + pb_en=0 ⇒ 菜单从 PUSH 一闪 WAIT 又掉回 OFF，
+          现场就是"始终切不到 PUSH"。21:11 那次能跑起来，只是因为车停在 0.2 m 外。
+       保护：进度必须走过"完成阈值点"（约为表长 1/4，夹在 4~30 点 = 0.3~2.2 m）之后，
+             才允许进终点圈判完成。半圈表也成立（阈值随 n 缩小，且不超过 n/2）。 */
+    {
+        uint16 need = (uint16)(s_n / 4u);
+
+        if (need < 4u)                      { need = 4u; }
+        if (need > 30u)                     { need = 30u; }
+        if (need > (uint16)(s_n / 2u))      { need = (uint16)(s_n / 2u); }
+        if (best >= need)                   { s_done_armed = 1u; }
+    }
+
     /* ---- 4) 完成 / 中止（Polaris 的两条判据；工程 10 只有"到表尾"）----
        · 进终点圈 ⇒ COMPLETED（正常收车）
        · 索引到末点、但离末点还远 ⇒ ABORTED（脱线/跳点，**不是**跑完了）
@@ -600,8 +680,26 @@ void route_pb_poll (void)
            已经撤掉 —— 那是为了绕开"8 字起点≈终点"，但真正的保护是：
            ① 起始进度点从第 3 点起（不是 0）；② 距离圈只有 pb_fin(0.15 m)；
            ③ 进度索引单调，只前进不后退。加"过半"反而会让半圈表永远收不了车。 */
-        if (ld2 < ((pb_fin > 0.02f) ? pb_fin : 0.02f))
+        /* ⚠ 必须先 s_done_armed（走过阈值点），否则闭合表在起点就判完成 */
+        if ((0u != s_done_armed) && (ld2 < ((pb_fin > 0.02f) ? pb_fin : 0.02f)))
         {
+            /* ★ 2026-10-22：不立刻 finish，先走一段**停车斜坡**（见 poll 开头）。
+               理由：`spd_target_* = 0` 是阶跃，速度环看到"实测 0.6 rps / 目标 0"
+               会立刻给反向大占空比 ⇒ 电流冲击 + 车头点一下。
+               只对 PWR 做（PUSH 本来就不给力，coast 已在跑）。
+               ⚠ 已经停下来（目标≈0）就不用斜坡，直接 finish，免得白等 0.4 s。 */
+            if ((pb_mode >= 1.5f) && (0u == s_ramp) &&
+                ((fabsf(spd_target_l) + fabsf(spd_target_r)) > 0.03f))
+            {
+                s_ramp_l  = spd_target_l;
+                s_ramp_r  = spd_target_r;
+                s_ramp_t0 = motor_link_now_ms();
+                s_ramp    = 1u;
+                printf("[PB] 终点停车斜坡: %.2f/%.2f rps -> 0 over %u ms\r\n",
+                       s_ramp_l, s_ramp_r, (unsigned)PB_STOP_MS);
+                return;
+            }
+
             pb_finish(PB_ST_DONE, "done: finish");
             pb_en = 0.0f;
             return;

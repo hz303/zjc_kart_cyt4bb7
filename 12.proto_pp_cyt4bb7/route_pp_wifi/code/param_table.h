@@ -78,7 +78,7 @@
     X( 0, "target_l",   "目标|左轮转速",      -8.000f,    8.000f,    0.000f, "rps",   0.050f, &spd_target_l,        P_CMD,     G_SPD  ) \
     X( 1, "target_r",   "目标|右轮转速",      -8.000f,    8.000f,    0.000f, "rps",   0.050f, &spd_target_r,        P_CMD,     G_SPD  ) \
     X( 2, "duty_limit", "限幅|占空比上限",     0.000f,  100.000f, SPD_DUTY_DEFAULT,  "%",   1.000f, &spd_duty_limit_pct, P_RW_IDLE, G_SYS  ) \
-    X( 3, "target_max", "限幅|目标转速上限",   0.000f,   20.000f,    3.500f, "rps",   0.100f, &spd_target_max,      P_RW_IDLE, G_SYS  ) /* 2026-10-22: 3.0 -> 3.5（后轮上限）*/ \
+    X( 3, "target_max", "限幅|目标转速上限",   0.000f,   20.000f,    3.200f, "rps",   0.100f, &spd_target_max,      P_RW_IDLE, G_SYS  ) /* 2026-10-22: 3.0 -> 3.5 -> 3.2（3.5 现场觉得太大）*/ \
     X( 4, "k_v",        "增益|比例 k_v",       0.000f,    2.000f, SPD_K_V_DEFAULT,   "-",   0.005f, &spd_g.k_v,          P_RW_LIVE, G_SPD  ) \
     X( 5, "k_z",        "增益|积分 k_z",       0.000f,   20.000f, SPD_K_Z_DEFAULT,   "-",   0.050f, &spd_g.k_z,          P_RW_LIVE, G_SPD  ) \
     X( 6, "inv_K",      "前馈|1/K",            0.000f,    0.500f, SPD_INV_K_DEFAULT, "-",   0.001f, &spd_g.inv_K,        P_RW_LIVE, G_SPD  ) \
@@ -103,7 +103,7 @@
     X(25, "steer_slew", "转向|目标斜坡",       0.000f,  200.000f,   0.000f, "deg/s", 1.000f, &steer.slew_deg_s,    P_RW_LIVE, G_STEER) \
     X(26, "steer_lim",  "转向|软限位",         0.000f,   27.000f,  27.000f, "deg",   0.500f, &steer.limit_deg,     P_RW_IDLE, G_STEER) \
     X(27, "rc_arm_en",  "遥控|允许接管",       0.000f,    1.000f,   1.000f, "-",     1.000f, &rc_arm_en,           P_RW_LIVE, G_RC   ) \
-    X(28, "rc_thr_max", "遥控|满杆转速",       0.000f,   20.000f,   3.500f, "rps",   0.100f, &rc_thr_max,          P_RW_LIVE, G_RC   ) /* 2026-10-22: 2.0 -> 3.5；不改它 target_max=3.5 在遥控下永远够不着 */ \
+    X(28, "rc_thr_max", "遥控|满杆转速",       0.000f,   20.000f,   3.200f, "rps",   0.100f, &rc_thr_max,          P_RW_LIVE, G_RC   ) /* 2026-10-22: 2.0 -> 3.5 -> 3.2；不改它 target_max 在遥控下永远够不着 */ \
     X(29, "ol_en",      "标定|开环模式",       0.000f,    1.000f,   0.000f, "-",     1.000f, &spd_ol_en,           P_CMD,     G_SYS  ) \
     X(30, "ol_duty_l",  "标定|左轮开环duty", -100.000f,  100.000f,   0.000f, "%",     1.000f, &spd_ol_duty_l,       P_CMD,     G_SYS  ) \
     X(31, "ol_duty_r",  "标定|右轮开环duty", -100.000f,  100.000f,   0.000f, "%",     1.000f, &spd_ol_duty_r,       P_CMD,     G_SYS  ) \
