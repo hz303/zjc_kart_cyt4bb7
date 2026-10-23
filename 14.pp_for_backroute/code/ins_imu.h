@@ -1,0 +1,227 @@
+/* C 车惯导 + 路表 - IMU 姿态与航向（IMU963RA + Mahony 九轴 AHRS）
+ * ① C 车用的就是 **IMU963RA**（工程 1/2/3 是 IMU660RA/BMI270）⇒ 驱动零改动；
+ * ② 它是 **九轴**（加计 + 陀螺 + 磁力计）⇒ 六轴下"yaw 不可观测"这个死穴被磁力计补上了；
+ * ③ 陀螺标定、磁力计 Min-Max 标定、"未标定则跳过磁修正"的防发散保护都已经写好。
+ * ⇒ 工程 1/2/3 在本工程里只剩**两条纪律**（见下）。
+ * ---- 相对 20.zf_clean 改了哪三处（**这是"灵敏"的关键**）------------------------------
+ * 【改 1｜陀螺死区】原: `if (-7 <= gx <= 7) gx = 0;`（±7 LSB）
+ * ±2000 dps 量程、÷14.3 ⇒ **7 LSB = 0.49 dps**。
+ * 而过桩/转向的真实角速度只有 **0.5~2 dps**（工程 1 的实测量级）
+ * ⇒ 原死区**吃掉近一半有用信号**，这就是"不灵敏"的主因。
+ * 现在: 死区改成 `INS_GYRO_DEADBAND_LSB`（默认 0.5 LSB ≈ 0.035 dps），
+ * 只削量化底噪（1 LSB = 0.0699 dps），不削真信号。
+ * 【改 2｜dt】原: `Mahony_AHRS_Update(0.01f)` —— **硬编码 10ms**。
+ * 硬编码有两个问题: ① 采样率一改（本工程用 5ms）就**静默错一倍**（yaw 转 90° 显示 180°）；
+ * ② 中断抖动会累积成航向误差。
+ * 现在: 用 **DWT 实测 dt**（`DWT->CYCCNT`，M7 自带），并把异常值钳回标称周期。
+ * 【改 3｜累积航向】原: `yaw = atan2f(...)` ⇒ 只有 ±180°，跨边界**丢整圈**。
+ * 路表要的是"相对起点的累积角"，可以超过 ±360°。
+ * 现在: 额外维护 `yaw_acc`，用**相邻四元数的相对旋转 Z 分量**逐拍累加（永不卷绕）。
+ * ---- 节拍 --------------------------------------------------------------------------
+ * `ins_imu_update()` 放 **5ms PIT 中断**里（200 Hz）。
+ * "SPI2 总线不可重入: 两个任务并发读会帧交错出垃圾 + 污染 Mahony"）。
+ * 主循环要看数据一律走 `ins_imu_snapshot()`，不要自己去读 SPI。
+ */
+
+#ifndef _INS_IMU_H
+#define _INS_IMU_H
+
+#include "zf_common_headfile.h"
+
+/* 一、配置 */
+/* reset 后正常（转盘控方向、油门控速度）→ 油门打满跑一小段 →
+ * **方向盘晃两下 → 猛向右打死 → 此后转盘再也控不动方向盘**。
+ * **IMU init 在 `user/main_cm7_1.c`（CM7_1 核）** ⇒ 两条 SPI 在两个核上。
+ * · 工程 9：`steer_abs`(SPI_4/SCB5) 在 CM7_0；**根本没有 IMU**。
+ * · 工程 10 P0：`steer_abs`(SPI_4/SCB5) 与 `ins_imu`(SPI_2/SCB9) **都在 CM7_0**
+ * ⇒ **这是本车第一次让 SPI_2 与 SPI_4 在同一条核上同时初始化**。
+ * （`CY_SYSCLK_DIV_24_5_BIT`，编号 `spi_n + 7`；**与 UART 同一个池**：UART 用 0~6、SPI 用 7~11），
+ * 且 `spi_pclk_dst[]` 是**手写的显式数组**（原版逐飞是按 `PCLK_SCB6_CLOCK + 偏移` 算出来的）。
+ * ⇒ "同核多 SPI 是否互相踩"这件事，**工程 9 与工程 8 都没验证过这个组合**
+ * （工程 9 = SPI_0+SPI_4；工程 8 = SPI_0+SPI_1+SPI_2；**SPI_2+SPI_4 从未共存**）。
+ * ⇒ 这个开关就是为了**一次烧录判定**：
+ * 0 = **完全不初始化 IMU**（`imu963ra_init()` 都不调 ⇒ SPI_2/SCB9 一个寄存器都不碰）
+ * 1 = 正常（默认）
+ * 判读：
+ * · 置 0 后**转向故障消失** ⇒ 就是 **SPI_2 与 SPI_4 同核冲突**（与电机、与接线无关）
+ * · 置 0 后**故障照旧** ⇒ 才轮到"编码器线路/干扰"那一支，再往下查（别一次动两件事）。
+ */
+#define INS_IMU_ENABLE              (1)             /* 0 = 不初始化 IMU（A/B 实验用） */
+
+#define INS_SAMPLE_HZ               (200)           /* 与 5ms PIT 一致 */
+#define INS_T_S                     (0.005f)
+
+#define INS_GYRO_DEADBAND_LSB       (0.5f)
+
+/* 磁力计读取分频：每 N 拍读一次（200/N Hz）。 磁力计走 sensor hub，本身是慢变量，50 Hz 足够；省下的时间留给控制。 */
+#define INS_MAG_DIV                 (4)
+
+/* yaw 符号：车头**向左**转（俯视逆时针）时 yaw 应增大 ⇒ 取 +1。 */
+#define INS_YAW_SIGN                (+1.0f)
+
+/* 上电陀螺标定 */
+#define INS_CALIB_SAMPLES           (1000)          /* 5ms 一拍 ⇒ 1000 点 = 5 s */
+#define INS_CALIB_MIN_SAMPLES       (300)
+#define INS_CALIB_MAX_RETRY         (5)
+/* 采样期内单轴极差（raw LSB）超过它就判"被碰过/在动"，重来。
+ * ±2000 dps 下 1 LSB = 0.0699 dps，300 LSB ≈ 21 dps 峰峰 —— 正常静止远小于它。
+ */
+#define INS_CALIB_MAX_SPAN_LSB      (300)
+/* 标定结果超限判为异常（传感器坏/线松） */
+#define INS_BIAS_LIMIT_LSB          (400.0f)
+
+/* Mahony 增益。**沿用 20.zf_clean 的值**（它已在 C 车上跑过）。 quick_* 是启动期的快收敛档（前 200 拍）。 */
+#define INS_MAHONY_KP               (10.0f)
+#define INS_MAHONY_KI               (0.005f)
+#define INS_MAHONY_QUICK_KP         (30.0f)
+#define INS_MAHONY_QUICK_KI         (0.005f)
+#define INS_MAHONY_QUICK_TICKS      (200)
+
+/* 解决什么问题：陀螺零偏在**上电 5 s 快照之后就冻结**了，而芯片前几分钟一直在升温，
+ * 零偏会走掉 1~2 LSB ⇒ 全部被积进 yaw。**六轴下 yaw 完全不可观测**（见速查"六轴 yaw
+ * 不可观测"），所以唯一的观测窗口就是"车真的没动" —— 这正是 ZUPT 存在的理由。
+ * 实测症状：上位机 ins_yaw 静止时**匀速单调上升**（0.07° → 0.14° → 0.34° …）。
+ * 吃掉了。改成 0.5 LSB（为了灵敏，见【改 1】）之后漂移才露出来 ——
+ * **所以正确做法不是把死区改回去**（那会连 0.5~2 dps 的真实角速度一起吃），
+ * 而是补上这里这套。
+ * 算法谱系: `D:\summer_car\2.imu_encoder_test\code\{yaw_filter.c, trail_att.c, yaw_solver.c}`
+ * （MM32 版，同款 IMU963RA，已在这台 C 车上验证过"静止不漂"）。
+ */
+/* ---- 静止判据：三轴陀螺 + 加计模长 + 去重力后的水平加速度，三者同时满足 ---- */
+#define INS_ZUPT_GYRO_LIMIT_DPS     (2.5f)      /* 单轴角速度上限（三轴取最大） */
+#define INS_ZUPT_ACC_TOL_G          (0.08f)     /* | |a| - 1g | 上限（0.08 g ≈ 0.78 m/s²） */
+#define INS_ZUPT_HORIZ_TOL_G        (0.06f)     /* 去重力后**水平**加速度上限（0.06 g ≈ 0.59 m/s²） */
+#define INS_ZUPT_ENTER_MS           (150u)      /* 连续满足多久判"静止"（防抖） */
+#define INS_ZUPT_EXIT_MS            (30u)       /* 连续不满足多久判"运动"（比进短得多 ⇒ 响应灵敏） */
+
+/* 静止时是否冻结航向（把 Z 轴角速度置 0，见 trail_att.c 的第 6 步）： 0 = 不冻结，只靠零偏估计修正。 */
+#define INS_ZUPT_FREEZE_YAW         (1)
+
+/* ---- 在线零偏估计（只在"确实静止"的窗口里开）----
+ * `static` 的退出有 30 ms 滞后，那 30 ms 里车其实已经在转了 —— 用它当门控会把
+ * **真实转速当成零偏吃进去**。MM32 实测过这个坑：90 dps 被吃 30 ms ⇒
+ * 零偏从 0.41 跳到 3.0 dps ⇒ 整段旋转少 32°。这是"越跑越歪"的经典来源，
+ * 也是本工程最贵的一条纪律。
+ */
+#define INS_BIAS_GATE_MS            (50u)       /* 瞬时条件连续满足这么久才允许动零偏 */
+#define INS_BIAS_TAU_MS             (2000.0f)   /* 一阶时间常数：静止 2 s 衰减到 37%，6 s 到 5% */
+
+/* 二、状态位（遥测 ins_flags 的高 8 位借用，低 8 位留给航位推算） */
+#define INS_ST_READY            (0x0001u)   /* 已上电标定完成并在运行 */
+#define INS_ST_WARN             (0x0002u)   /* 有告警（见下面 detail） */
+#define INS_ST_MAG_CAL_DONE     (0x0004u)   /* 磁力计已标定（磁修正生效） */
+#define INS_ST_MAG_CAL_RUN      (0x0008u)   /* 磁力计标定进行中 */
+#define INS_ST_IMU_LINK_BAD     (0x0010u)   /* IMU 通信异常 */
+#define INS_ST_GYRO_SAT         (0x0020u)   /* 陀螺饱和 */
+#define INS_ST_DT_BAD           (0x0040u)   /* dt 异常（被钳过） */
+/* 逐飞板子上 DWT->CYCCNT 不计数是可能的（调试单元相关），而本工程的 5ms 是 PIT 硬周期驱动，
+ * 标称 dt 本身就是准的 —— 所以不应该把它报成"异常"，否则每次上电都挂着告警。
+ */
+#define INS_ST_DT_NODWT         (0x0080u)   /* DWT 不可用，dt = 标称周期 */
+
+#define INS_ST_STATIC           (0x0100u)   /* 当前判定为静止（ZUPT 通过） */
+#define INS_ST_BIAS_TRK         (0x0200u)   /* 本拍在跟踪零偏（门控通过） */
+
+/* 三、快照（主循环用；中断里更新，取的时候一次拿全，避免撕裂） */
+typedef struct
+{
+    float   yaw_acc;
+    float   yaw_raw;        /* Mahony 输出的 -180~180（诊断用） */
+    float   roll;           /* 横滚（度） */
+    float   pitch;          /* 俯仰（度） */
+    float   gyro_z_dps;     /* 去零偏、过死区后的 Z 轴角速度（°/s） */
+    float   dt_ms;          /* 本拍实测 dt（ms） */
+    float   acc_norm_g;     /* |a|（g），静止时应 ≈1 */
+    float   horiz_acc_g;
+    uint8   is_static;
+    uint8   bias_trk;
+    uint16  flags;          /* INS_ST_* */
+    uint16  seq;            /* 采样序号（应匀速增长） */
+} ins_imu_snap_t;
+
+/* 四、接口 */
+/* 上电初始化：DWT 时间源 + IMU963RA + 陀螺零偏标定（**阻塞，要求车静止**）+ 姿态复位。
+ * 返回 0 = 成功；1 = IMU 器件初始化失败；2 = 标定失败（结果超限）。
+ */
+uint8   ins_imu_init            (void);
+
+/* 5ms 每拍：读 IMU → 去零偏/死区 → Mahony 九轴 → 更新累积 yaw。 */
+void    ins_imu_update          (void);
+
+uint8   ins_imu_ready           (void);
+uint16  ins_imu_flags           (void);
+
+/* 这样"IMU 没接好"永远不会把 5ms 中断拖住（中断里访问外部器件的唯一硬约束）。 */
+uint8   ins_imu_link_ok         (void);
+
+/* 链路坏时从【主循环】调（约 1Hz）：重试一次器件初始化。返回 1 = 刚恢复。 */
+uint8   ins_imu_try_recover     (void);
+
+/* 逐飞 CYT4BB7 主板的 IMU660RA / IMU660RC / IMU963RA **引脚完全相同**，谁在板上只能靠读 ID：
+ * 963RA(LSM6DSL) WHO_AM_I **@0x0F**（期望 0x6A）｜660RA CHIP_ID @0x00 ｜660RC CHIP_ID **@0x0F**
+ * ⇒ 打印这两个字节就能分辨"963RA 在 / 660 系在 / 什么都没读到（接线）"。
+ * `valid` 为 0 表示还没探测过（init 没跑）。
+ */
+void    ins_imu_dev_id_get      (uint8 *id_0f, uint8 *id_00, uint8 *valid);
+
+/* 累积航向（度，可超 ±360）。这是惯导唯一需要的 IMU 输出。 */
+float   ins_imu_get_yaw         (void);
+uint16  ins_imu_yaw_rej         (void);   /* 被"单拍 >90 度"闸门丢掉的拍数：非 0 = 航向有毛刺/被重置 */
+float   ins_imu_get_roll        (void);
+float   ins_imu_get_pitch       (void);
+float   ins_imu_get_gyro_z_dps  (void);
+
+/* 把累积 yaw 归零（不改姿态四元数） / 直接设定累积 yaw */
+void    ins_imu_zero_yaw        (void);
+void    ins_imu_set_yaw         (float deg);
+
+/* 重做陀螺零偏标定（要求静止） */
+uint8   ins_imu_calib_gyro      (void);
+
+/* 回答"ZUPT 到底吃掉了多少转角"：冻结期间 `gz` 被强制为 0 ⇒ 那段时间的真实转动丢了。
+ * ticks —— 冻结拍数（×5 ms = 冻结时长）
+ * deg   —— 冻结期间被丢弃的 |gyro| 积分（度）
+ * 判读：ticks 大而 deg ≈ 0 = 只是停着（正确）；deg 明显 > 0 = 真在转却被冻（丢角）。
+ * `_get` 取走即清（1 Hz 窗口口径）；`_ticks/_deg` 只读不清；`_reset` 由录表起点调用。
+ */
+void    ins_imu_zupt_frz_get    (uint32 *ticks, float *deg);
+uint32  ins_imu_zupt_frz_ticks  (void);
+float   ins_imu_zupt_frz_deg    (void);
+void    ins_imu_zupt_frz_reset  (void);
+
+/* 磁力计 Min-Max 标定：start 之后**手动绕各轴各转一圈**，再 stop 结算。 标定完成后磁修正才生效（未标定时跳过磁修正，防止未校准磁数据正反馈发散）。 */
+void    ins_imu_mag_calib_start (void);
+void    ins_imu_mag_calib_stop  (void);
+
+/* 取一份一致的快照（内部关中断复制，避免主循环读到半拍数据） */
+void    ins_imu_snapshot        (ins_imu_snap_t *out);
+
+/* 五、诊断（专治"读不到"—— 上电横幅与 1Hz 诊断行用） */
+/* 若它一直不涨，编码器/IMU 都读不到就是理所当然的（两者都只在中断里更新）， 问题在 PIT / 中断使能，而不是传感器接线。 */
+extern volatile uint32 ins_diag_isr_ticks;
+void    ins_diag_isr_enter     (void);
+
+/* 判据：稳定 ≈5000 µs ⇒ 中断没抖，测速跌是"真掉速"； 偶发 6000~9000 ⇒ 中断被拖住，测速是"假跌"（编码器 Δ 偏小）⇒ 去查 ISR 里谁在等。 */
+void    ins_diag_tick_take     (uint32 *min_us, uint32 *max_us);
+
+/* 间隔 > 7.5 ms 的**累计**拍数（只增不清）。1Hz 行里是 `TIMING ... long=`：
+ * 它持续增长 ⇒ 中断在被反复拖过，这就是"测速假跌 + 占空比尖峰"的物理来源。
+ */
+extern volatile uint32 ins_diag_tick_long_cnt;
+
+/* 与上面"间隔"是两个不同的量：间隔看周期准不准，这里看**这一次中断跑了多久**。
+ * 判据：常态 ≈150~250 µs ⇒ 轻；偶发 > 1000 µs ⇒ **ISR 里有阻塞**（SPI 忙等超时？）。
+ * 在 cm7_0_isr.c 的 pit0_ch2_isr() **最后一句**调用 ins_diag_isr_leave()。
+ */
+void    ins_diag_isr_leave     (void);
+void    ins_diag_isr_cost_take (uint32 *min_us, uint32 *max_us);
+
+/* 最近一拍的 IMU 原始值（LSB）。**手转轮子无关，晃动模块时看它们变不变**： 全是 0 或全是 ±32767 / ±1 ⇒ IMU 根本没通（SPI/CS/供电），不用怀疑算法。 */
+void    ins_diag_get_imu_raw   (int16 *ax, int16 *ay, int16 *az,
+                                int16 *gx, int16 *gy, int16 *gz,
+                                int16 *mx, int16 *my, int16 *mz);
+
+/* 陀螺零偏标定的结果（LSB），诊断用 */
+void    ins_diag_get_bias      (float *bx, float *by, float *bz);
+
+#endif

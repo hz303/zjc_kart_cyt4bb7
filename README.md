@@ -56,13 +56,17 @@ zjc_kart_cyt4bb7/
 │       │                           spd_* / steer_* / motor_* / remote_ctrl（继承工程 9/10）
 │       └── user/                   main_cm7_0.c、cm7_0_isr.c（CM7_1 为空工程）
 │
+├── 14.pp_for_backroute/            车端固件 —— 工程 14（路表回放专用版，扁平结构）
+│   ├── code/                       与工程 12 同源模块 + 回放适配
+│   └── user/                       main_cm7_0.c、cm7_0_isr.c（CM7_1 为空工程）
+│
 └── KartHost/                       PC 上位机（C# .NET 9 WinForms）
     ├── README.md                   上位机说明
     ├── *.cs / Ui/                  源码（协议层 / 链路层 / 波形 / 参数面板 / 标定窗 / 自检）
     └── KartHost.csproj
 ```
 
-### 四个车端版本的关系
+### 五个车端版本的关系
 
 | 目录 | 版本 | 内容 |
 |---|---|---|
@@ -70,6 +74,7 @@ zjc_kart_cyt4bb7/
 | `9.steer_rc_wifi_cyt4bb7/` | **工程 9** | **工程 7 + 队友最新线束引脚 + 遥控（逐飞 UART 接收机，不依赖 WiFi）+ 转向位置环** |
 | `10.ins_route_rc_cyt4bb7/` | **工程 10** | **工程 9 复制 + 三路驱动电机按队友 `Karting-Project` ca55f2b 全部换脚**（转向 → P05_0/P05_1），遥控/编码器/角度传感器不动 |
 | `12.proto_pp_cyt4bb7/` | **工程 12** | **路表 + 纯跟踪主线**：合流工程 10/11 的模块 —— 航迹推算（`ins_*`）+ Flash 路表（`route_app`/`route_link`）+ 纯跟踪（`route_pb`）+ 统一协议/权限层（`proto`，唯一写入点）+ 板载菜单（`ui_*`） |
+| `14.pp_for_backroute/` | **工程 14** | **路表回放专用版**（工程 12 模块同源,面向倒车路表回放场景） |
 
 > ⚠ **引脚表以版本各自文档为准。** 工程 9 把三路驱动电机的引脚**整体轮转**过一遍，
 > `9.steer_rc_wifi_cyt4bb7/00-工程9-遥控与引脚移植说明.md` 的引脚总表**取代**下面工程 7 那张表 ——

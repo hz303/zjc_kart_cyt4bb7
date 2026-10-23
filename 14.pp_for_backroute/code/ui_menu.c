@@ -1,0 +1,1099 @@
+/* 工程 11（卡丁）· 屏幕菜单（IPS200 竖屏 + 主板 4 键）
+ * 现场翻页翻不完，菜单从 23 项收敛到 9 项，每一项都是"跑车那天真会按"的：
+ * 1. Dashboard   仪表盘（车速/航向/位姿/安全/遥控，K1 进 K2 出）
+ * 2. CtrlMode    控制模式（**预留**：当前只有手动，占位显示）
+ * 3. Rec/Save    表录制 / 停录自动落盘（按一下开、再按一下停）
+ * 4. Rt ds       采样点距 0.05~0.15 m，步长 **0.01**
+ * 5. Rt Status   表状态：槽 / 点数 / REC-SAV-ok / 上次返回码
+ * 6. Follow      跟随模式：1=PUSH（只舵机、后轮不给力，人推车）2=PWR（带速度）
+ * 7. Speed       跟随基础速度 **0.8~3.0 rps**，步长 0.1（内部写 pb_vmax = rps×mpm）
+ * 8. Save Par    参数写 Flash（不按这一下，上电全回源码默认）
+ * 9. Reset       参数恢复默认（**只写 RAM**，要留就再按 8）
+ * 11.RevRec  倒车录表  0/1（ID76）：倒着开车录表时把 v 存成 |v|，REV 标记照打
+ * 12.RevPlay 倒序回放  0/1（ID77）：回放时把点序倒过来，车正着开、沿表反向走
+ * 离开菜单的东西并没有消失 —— 跑班 / 开环标定 / k_v / k_z / Umax / 打角前馈
+ * 全部还在**上位机 + 手机 App** 上，那些地方有一屏能看全的表；屏幕只有 4 个键，
+ * 不该承担"调 60 个参数"的活。
+ * ---- 键位（与工程 8/10 一致）--------------------------------------------------------
+ * K1 = 确认/进编辑       K2 = 返回/退编辑
+ * K3 = 光标下移          K4 = 光标上移（长按每 100 ms 走一步）
+ * ---- 页面 ------------------------------------------------------------------------------
+ * LIST  9 项（只有按键那一拍重画 ⇒ 空闲屏幕 SPI 全静默）
+ * EDIT  改一项（K3/K4 按该项自己的步长加减，K1 生效返回）
+ * DASH  仪表盘（ui_core 字段引擎，逐字段比对缓存，变了才画）
+ * 车端 `MOTOR_CMD_SAVE` **只回 ACK、不写 Flash**。没有这一项，每次上电
+ * `k_v/k_z/ins_mpm/转向限位/跟随速度` 全回源码默认值。
+ */
+
+#include "zf_common_headfile.h"
+#include "ui_menu.h"
+#include "ui_core.h"
+#include "zf_device_key.h"
+
+#include "motor_link.h"
+#include "spd_ctrl.h"
+#include "spd_enc.h"
+#include "spd_safety.h"
+#include "steer_ctrl.h"
+#include "remote_ctrl.h"
+#include "ins_odom.h"
+#include "ins_imu.h"
+
+#include "spd_bench.h"
+#include "bench_log.h"
+#include "app_params.h"
+#include "proto.h"
+#include "ins_route.h"          /* 路表：点数/槽号/点距 */
+#include "route_app.h"          /* 路表：录制/选槽命令量 */
+#include "route_pb.h"           /* 路表：回放使能 / pb_mode / pb_vmax */
+
+/* 一、页面模式 */
+#define UM_LIST         (0u)
+#define UM_EDIT         (1u)
+#define UM_DASH         (2u)
+
+#define UM_ROW_TITLE    (0u)
+#define UM_ROW_ITEM0    (1u)
+#define UM_ROW_HINT     (17u)       /* 固定最后一行 */
+#define UM_HINT         "K1=OK K2=Bk K3/K4=Move"
+
+/* 现场发现方向反了只改这里 +1 ⇄ -1，不要动接线与 KEY_LIST 顺序。 */
+#define UM_DIR_SIGN     (+1)
+
+/* 二、菜单项
+ * ACT  = 执行动作
+ * PF   = 直接编辑参数表的某一项（量程/步长**取自车端参数表**，不在菜单里重写）
+ * MODE = 跟随模式（1/2，写 pb_mode，显示成 PUSH/PWR）
+ * RPS  = 跟随基础速度（**rps** 口径，内部写 pb_vmax = rps × ins_m_per_rev）
+ */
+#define UM_ACT      (0u)
+#define UM_PF       (1u)
+#define UM_MODE     (2u)
+#define UM_RPS      (3u)
+#define UM_SLOT     (4u)
+/* · pb L（ID48 有效轴距）：0.660 / 0.650 —— 0.65 相当于把转向增益放大 1.5%
+ * · df W（ID57 后轮中心距）：0.605 / 0.650 —— 0.65 = 0.605×1.073，
+ * 正好补上 R_wheel 与 R_yaw 那 7.3% 的系统差（也让"轮距 0.605 / 车宽 0.67"
+ * 那个矛盾消失：0.605 只剩 3 cm 胎宽）。
+ */
+#define UM_PBL      (5u)
+#define UM_DFW      (6u)
+
+typedef struct
+{
+    const char *name;
+    uint8       kind;
+    void      (*act)(void);
+    uint8       pid;                /* PF：参数表 ID */
+} um_item_t;
+
+static void act_dash  (void);
+static void act_mode  (void);
+static void act_rtrec (void);
+static void act_sts   (void);
+static void act_psave (void);
+static void act_reset (void);
+
+static const um_item_t UM_ITEMS[] =
+{
+    /* name            kind      action       pid */
+    { "1.Dashboard",   UM_ACT,   act_dash,    0u  },
+    { "2.CtrlMode",    UM_ACT,   act_mode,    0u  },
+    { "3.Rec/Save",    UM_ACT,   act_rtrec,   0u  },
+    { "4.Rt ds",       UM_PF,    0,           39u },   /* 路表|采样点距（0.05~0.15，步长 0.01） */
+    { "5.Rt Status",   UM_ACT,   act_sts,     0u  },
+    /* 现场只有屏幕时没法把"电子表槽 2"换成"手推录的槽 0"。
+     * K3/K4 一按就生效（不用再按 K1）：先校验、再选 active、然后立刻载入 RAM；
+     * 空槽/正在跟随/正在录制/正在落盘 一律拒绝，并把原因写在标题行。
+     */
+    { "6.Slot",        UM_SLOT,  0,           0u  },
+    { "7.Follow",      UM_MODE,  0,           0u  },   /* pb_mode：1=PUSH 2=PWR */
+    { "8.Speed",       UM_RPS,   0,           0u  },   /* 0.8/1.2/2.4/3.0 rps 四档 */
+    /* pb L 影响 δ=atan(L·κ)（整条回放的转向增益）；df W 影响电子差速分配。 */
+    { "9.pb L",        UM_PBL,   0,           0u  },   /* 0.650 / 0.660 m */
+    { "10.df W",       UM_DFW,   0,           0u  },   /* 0.605 / 0.650 m */
+    /* 直接绑参数表 ID76/77；量程 0~1、步长 1 ⇒ 按一下就在 0/1 之间切）。 */
+    { "11.RevRec",     UM_PF,    0,           76u },   /* 0/1 倒车录表 */
+    { "12.RevPlay",    UM_PF,    0,           77u },   /* 0/1 倒序回放 */
+    { "13.Save Par",   UM_ACT,   act_psave,   0u  },
+    { "14.Reset",      UM_ACT,   act_reset,   0u  },   /* 参数恢复默认（只写 RAM） */
+};
+
+#define UM_NITEMS   ((uint8)(sizeof(UM_ITEMS) / sizeof(UM_ITEMS[0])))
+
+/* ---- 第 7 项的取值范围（**rps 口径**）------------------------------------------------
+ * 用户口径是 rps，而 pb_vmax 在车端是 m/s ⇒ 菜单这边换算，参数表不动。
+ */
+/* 现场只有"慢 / 中 / 快"三档要选；连续 0.1 步长在 4 键屏上要按十几次， 还容易停在 1.199999 这种数上。档位表就在这里，改档 = 查表。 */
+static const float UM_PWR_GEAR[] = { 0.8f, 1.2f, 2.4f, 3.0f };
+#define UM_PWR_NGEAR    ((uint8)(sizeof(UM_PWR_GEAR) / sizeof(UM_PWR_GEAR[0])))
+
+static const float UM_PBL_CHOICE[] = { 0.650f, 0.660f };
+static const float UM_DFW_CHOICE[] = { 0.605f, 0.650f };
+#define UM_PBL_N    ((uint8)(sizeof(UM_PBL_CHOICE) / sizeof(UM_PBL_CHOICE[0])))
+#define UM_DFW_N    ((uint8)(sizeof(UM_DFW_CHOICE) / sizeof(UM_DFW_CHOICE[0])))
+
+/* 把一个 rps 值吸到最近的档位（参数被 App/上位机改成别的值时也不会显示成怪数） */
+/* 通用：在候选值里找最近的序号（二值项与 8.Speed 共用思路） */
+static uint8 um_nearest (float v, const float *arr, uint8 n)
+{
+    uint8 best = 0u, i;
+    float bd = 1.0e9f;
+
+    for (i = 0u; i < n; i ++)
+    {
+        float d = v - arr[i];
+
+        if (d < 0.0f) { d = -d; }
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+static uint8 um_gear_of (float rps)
+{
+    uint8 g;
+    uint8 best = 0u;
+    float bd   = 1.0e9f;
+
+    for (g = 0u; g < UM_PWR_NGEAR; g ++)
+    {
+        float d = rps - UM_PWR_GEAR[g];
+
+        if (d < 0.0f) { d = -d; }
+        if (d < bd) { bd = d; best = g; }
+    }
+    return best;
+}
+
+/* 提示行（列表标题右侧那一行）。放在这里是因为 um_write() 也要往它里面写"拒跑原因"。 */
+static char   s_msg[24] = "";
+/* 而且整屏 SPI 传输还把主循环拖慢（route_pb_poll 也跟着抖）。 */
+static uint8  s_edit_dirty = 0u;
+static float  s_edit_v     = 0.0f;
+
+/* 三、参数表查找（量程/指针都从协议层元数据取）
+ * 现在只有 `param_table.h` 一份，元数据由 `proto_param_by_id()` 提供 ——
+ * 加字段时不会再出现"这个文件漏改了、编不过"（更糟的是顺序错了却编得过）。
+ */
+static volatile float *um_ptr(uint8 id)
+{
+    const proto_param_t *p = proto_param_by_id(id);
+
+    return (NULL == p) ? 0 : p->ptr;
+}
+
+static uint8 um_range(uint8 id, float *lo, float *hi, float *st)
+{
+    const proto_param_t *p = proto_param_by_id(id);
+
+    if (NULL == p) { return 0u; }
+
+    *lo = p->lo;
+    *hi = p->hi;
+    *st = p->step;
+    return 1u;
+}
+
+/* ---- 统一取/存：三种 kind 都在这里落地，编辑页与列表页共用 ---------------------------- */
+static uint8 um_read(uint8 idx, float *v, float *lo, float *hi, float *st)
+{
+    const um_item_t *it = &UM_ITEMS[idx];
+
+    switch (it->kind)
+    {
+        case UM_PF:
+        {
+            volatile float *p = um_ptr(it->pid);
+
+            if ((0 == p) || (0u == um_range(it->pid, lo, hi, st))) { return 0u; }
+            *v = *p;
+            return 1u;
+        }
+
+        case UM_MODE:                       /* 三态：0=OFF 1=PUSH 2=PWR */
+            *v  = (pb_en < 0.5f) ? 0.0f : ((pb_mode > 1.5f) ? 2.0f : 1.0f);
+            *lo = 0.0f;
+            *hi = 2.0f;
+            *st = 1.0f;
+            return 1u;
+
+        case UM_SLOT:                       /* 槽号：读的是"当前 active"，写见 um_write */
+            *v  = (float)ins_route_slot_active();
+            *lo = 0.0f;
+            *hi = (float)(INS_RT_SLOT_COUNT - 1u);
+            *st = 1.0f;
+            return 1u;
+
+        case UM_PBL:                        /* 二值：有效轴距 */
+        case UM_DFW:                        /* 二值：后轮中心距 */
+        {
+            const float *arr = (UM_PBL == it->kind) ? UM_PBL_CHOICE : UM_DFW_CHOICE;
+            uint8        n   = (UM_PBL == it->kind) ? UM_PBL_N      : UM_DFW_N;
+            float        cur = (UM_PBL == it->kind) ? pb_l : spd_diff_w;
+
+            *v  = arr[um_nearest(cur, arr, n)];
+            *lo = arr[0];
+            *hi = arr[n - 1u];
+            *st = 0.0f;                     /* 记号：不是等差数列，别用 +=st */
+            return 1u;
+        }
+
+        case UM_RPS:                        /* 显示 rps（3 档吸附），存 m/s */
+        {
+            float mpr = (ins_m_per_rev > 1e-4f) ? ins_m_per_rev : 0.8193f;
+            uint8 g   = um_gear_of(pb_vmax / mpr);
+
+            *v  = UM_PWR_GEAR[g];
+            *lo = UM_PWR_GEAR[0];
+            *hi = UM_PWR_GEAR[UM_PWR_NGEAR - 1u];
+            /* st = 0 是给按键处理看的记号：**不是等差数列，别用 +=st 那套** */
+            *st = 0.0f;
+            return 1u;
+        }
+
+        default:
+            return 0u;
+    }
+}
+
+/* ---- 菜单要写的参数 ID（**与 param_table.h 对齐**；ID 是协议，不许插队）---- */
+#define UM_ID_STEER_EN  (23u)
+#define UM_ID_RT_REC    (38u)
+#define UM_ID_PB_EN     (43u)
+#define UM_ID_PB_MODE   (44u)
+#define UM_ID_PB_L      (48u)   /* 回放|有效轴距（二值：0.650 / 0.660） */
+#define UM_ID_DF_W      (57u)   /* 差速|轮距(轮心)（二值：0.605 / 0.650） */
+#define UM_ID_PB_VMAX   (45u)
+
+/* 令牌持有者 → 三个字母，屏幕那行只放得下这么点 */
+static const char * um_src_name (uint8 src)
+{
+    switch (src)
+    {
+        case PROTO_SRC_RC:       return "RC";
+        case PROTO_SRC_SPI:      return "PC";
+        case PROTO_SRC_MENU:     return "MENU";
+        case PROTO_SRC_INTERNAL: return "INT";
+        default:                 return "-";
+    }
+}
+
+/* "已使能但没跑起来"：pb_en=1 却 route_pb 不在 RUN（没表 / odom 关 / 起跑失败）。
+ * 不把它显示出来，现场只会看到屏幕写着 PUSH、车纹丝不动 —— 然后怀疑按键坏了。
+ */
+static uint8 um_pb_wait (void)
+{
+    return ((pb_en > 0.5f) && (0u == route_pb_active())) ? 1u : 0u;
+}
+
+/* ---- 统一写入口：菜单的每一次"改参数"都走协议层（权限 / 钳位 / 驱动令牌）----
+ * 于是"谁在开车"这件事在菜单这一路完全不存在：遥控开着车，屏幕照样能把回放打开。
+ * 现在一律 um_set()：被拒时把原因写进提示行（现场只有 4 个键，得自己说出来）。
+ */
+static uint8 um_set (uint8 id, float v)
+{
+    proto_msg_t m;
+    float out = 0.0f;
+    uint8 e;
+
+    m.src   = PROTO_SRC_MENU;
+    m.op    = PROTO_OP_SET;
+    m.id    = id;
+    m.val   = v;
+    m.token = 0u;
+
+    e = proto_exec(&m, &out);
+
+    if (PROTO_OK != e)
+    {
+        /* RC  = CH6 还合着（遥控就是驾驶员）⇒ 先把使能开关收回来再按
+         * PC  = 上位机占着（它在续租）⇒ 先停掉上位机的目标写入
+         * MENU= 自己（上一次写的租期还没走完，极少见）
+         */
+        snprintf(s_msg, sizeof(s_msg), "REFUSE %s by %s",
+                 proto_err_name(e), um_src_name(proto_drv_owner()));
+    }
+    return e;
+}
+
+static void um_write(uint8 idx, float v)
+{
+    const um_item_t *it = &UM_ITEMS[idx];
+
+    switch (it->kind)
+    {
+        case UM_PF:
+            (void)um_set(it->pid, v);
+            break;
+
+        case UM_MODE:
+            /* 0 = 停（pb_en=0）｜1 = 无动力（pb_en=1 + pb_mode=1，人推车）｜2 = 带速度。 */
+            if (v < 0.5f)
+            {
+                (void)um_set(UM_ID_PB_EN, 0.0f);
+            }
+            else if (route_app_count() < (uint16)PB_MIN_POINTS)
+            {
+                /* 没有表就别让它"看起来开了又自己关"：现场只会看到 pb_en 弹回 0， 以为是按键坏了。这里直接说清楚。 */
+                (void)um_set(UM_ID_PB_EN, 0.0f);
+                snprintf(s_msg, sizeof(s_msg), "REFUSE: no table");
+            }
+            else
+            {
+                /* 一步失败就停：否则会留下"模式写进去了、使能没写进去"的半套状态 */
+                if (PROTO_OK == um_set(UM_ID_PB_MODE, (v > 1.5f) ? 2.0f : 1.0f))
+                {
+                    route_pb_rearm();           /* 允许重试：起跑失败后 s_arm 会锁住 */
+                    /* 而"跟随表"天然要求舵机在位控状态（否则方向盘是自由的）。 关掉跟随（OFF）时**不**撤销内环 —— 保持住当前位置比松手安全。 */
+                    (void)um_set(UM_ID_STEER_EN, 1.0f);
+                    (void)um_set(UM_ID_PB_EN, 1.0f);
+
+                    /* 使能写进去了，但回放可能起不来（没表 / odom 关 / 起跑失败）—— 当场把 route_pb 的原因贴出来，别让人以为"按键没反应"。 */
+                    if (0u != um_pb_wait())
+                    {
+                        snprintf(s_msg, sizeof(s_msg), "WAIT: %s", route_pb_reason());
+                    }
+                }
+            }
+            break;
+
+        case UM_SLOT:
+        {
+            uint8                 sl   = (uint8)(v + 0.5f);
+            uint8                 prev = ins_route_slot_active();
+            ins_route_slot_info_t inf;
+
+            /* ---- 三种状态下不许换表 ----
+             * ① 跟随在跑（含 PUSH）：换表会让"最近点"当场跳到另一条曲线上；
+             * ② 正在录制：换表等于把正在录的点丢掉（RAM 表被覆盖）；
+             * ③ 正在落盘：页写中途去读别的页，两边都拖慢，还容易误判失败。
+             */
+            if ((pb_en > 0.5f) || (0u != route_pb_active()))
+            {
+                snprintf(s_msg, sizeof(s_msg), "REFUSE: follow ON");
+                break;
+            }
+            if (0u != ins_route_is_running())
+            {
+                snprintf(s_msg, sizeof(s_msg), "REFUSE: recording");
+                break;
+            }
+            if (0u != ins_route_flash_busy())
+            {
+                snprintf(s_msg, sizeof(s_msg), "REFUSE: flash busy");
+                break;
+            }
+            if (sl >= (uint8)INS_RT_SLOT_COUNT) { break; }
+            if (sl == prev)
+            {
+                snprintf(s_msg, sizeof(s_msg), "S%u already", (unsigned)sl);
+                break;
+            }
+
+            /* 空槽直接拒绝：切过去只会在 7.Follow 那里报 no table， 而且 active_slot 已经被写坏（下次上电还是空槽）。 */
+            if ((0u == ins_route_slot_info(sl, &inf)) || (0u == inf.valid))
+            {
+                snprintf(s_msg, sizeof(s_msg), "S%u EMPTY", (unsigned)sl);
+                break;
+            }
+
+            if (0u != ins_route_slot_set_active(sl, 1u))
+            {
+                snprintf(s_msg, sizeof(s_msg), "S%u set FAIL", (unsigned)sl);
+                break;
+            }
+            if (0u == ins_route_flash_load_slot(sl))
+            {
+                /* 索引说有表、页上却读不出来（半写/掉电）⇒ 回滚，别留下"选了个空槽" */
+                (void)ins_route_slot_set_active(prev, 1u);
+                snprintf(s_msg, sizeof(s_msg), "S%u LOAD FAIL", (unsigned)sl);
+                break;
+            }
+            snprintf(s_msg, sizeof(s_msg), "S%u loaded %upt",
+                     (unsigned)sl, (unsigned)inf.count);
+            break;
+        }
+
+        case UM_PBL:
+            (void)um_set(UM_ID_PB_L, v);
+            break;
+
+        case UM_DFW:
+            (void)um_set(UM_ID_DF_W, v);
+            break;
+
+        case UM_RPS:
+        {
+            float mpr = (ins_m_per_rev > 1e-4f) ? ins_m_per_rev : 0.8193f;
+
+            (void)um_set(UM_ID_PB_VMAX, v * mpr);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+/* 四、状态 */
+static uint8  s_mode   = UM_LIST;
+static uint8  s_cur    = 0u;
+static uint8  s_rep3   = 0u;
+static uint8  s_rep4   = 0u;
+static uint8  s_top    = 0u;
+static uint32 s_last   = 0u;
+static uint32 s_stlast = 0u;
+static uint8  s_savlast= 0u;
+
+/* 仪表盘字段表 */
+static void dash_fmt(char *buf, uint8 size, void *ctx);
+static const uint8 s_dix[10] = { 0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u };
+static ui_field_t  s_df[10];
+static ui_page_t   s_dpage;
+
+/* 五、动作 */
+static void act_dash(void)
+{
+    s_mode = UM_DASH;
+    ui_page_mark_dirty(&s_dpage);
+}
+
+/* 控制模式：**预留**。当前只有"手动"一种，显示出来占位，K1 不做事。 比让人以为菜单漏了要好。 */
+static void act_mode(void)
+{
+    snprintf(s_msg, sizeof(s_msg), "ctrl: MANUAL (reserved)");
+}
+
+/* 表录制：按一下开始（写槽 0），再按一下停止。
+ * 只写了半张表、头页没写 ⇒ 上电载入失败 ⇒ 0 点。所以提示里给 SAV..，
+ * 写完由 ui_menu_task 自动刷成 "SAVE ok n=..."。
+ */
+static void act_rtrec(void)
+{
+    if (rt_rec_cmd < 0.5f)
+    {
+        if (PROTO_OK != um_set(UM_ID_RT_REC, 1.0f)) { return; }
+        snprintf(s_msg, sizeof(s_msg), "REC start %umm",
+                 (unsigned)(ins_route_ds * 1000.0f + 0.5f));
+    }
+    else
+    {
+        if (PROTO_OK != um_set(UM_ID_RT_REC, 0.0f)) { return; }
+        snprintf(s_msg, sizeof(s_msg), "REC stop n=%u SAV..",
+                 (unsigned)route_app_count());
+    }
+}
+
+/* 表状态快照（现场没串口时唯一能看的地方） rc: 1=写完 2=读回校验失败 3=没东西可写 4=槽越界；按一次是快照，看进度就等一秒再按。 */
+static void act_sts(void)
+{
+    uint8 rc = ins_route_flash_last_rc();
+
+    snprintf(s_msg, sizeof(s_msg), "S%u %upt %s rc=%u",
+             (unsigned)ins_route_slot_active(),
+             (unsigned)route_app_count(),
+             (0u != ins_route_is_running()) ? "REC" :
+             ((0u != ins_route_flash_busy()) ? "SAV" : "ok"),
+             (unsigned)rc);
+}
+
+static void act_psave(void)
+{
+    proto_msg_t m;
+    float e = 0.0f;
+    uint8 r;
+
+    m.src   = PROTO_SRC_MENU;
+    m.op    = PROTO_OP_SAVE;
+    m.id    = 0u;
+    m.val   = 0.0f;
+    m.token = 0u;
+
+    r = proto_exec(&m, &e);                  /* 真正落盘在 proto -> app_param_save() */
+
+    if (PROTO_OK == r)
+    {
+        snprintf(s_msg, sizeof(s_msg), "saved to flash OK");
+    }
+    else if (PROTO_ERR_BUSY == r)
+    {
+        snprintf(s_msg, sizeof(s_msg), "BUSY: host driving");
+    }
+    else
+    {
+        snprintf(s_msg, sizeof(s_msg), "SAVE FAIL err=%u", (unsigned)(int)e);
+    }
+}
+
+/* 参数恢复默认：**只写 RAM**，要留住必须再按 8.Save Par。 直接覆盖 Flash 就把现场调好的那套抹了 —— 多一步，但可后悔。 */
+static void act_reset(void)
+{
+    proto_msg_t m;
+    uint8 r;
+
+    m.src   = PROTO_SRC_MENU;
+    m.op    = PROTO_OP_LOAD_DEF;
+    m.id    = 0u;
+    m.val   = 0.0f;
+    m.token = 0u;
+
+    r = proto_exec(&m, NULL);
+
+    if (PROTO_OK == r) { snprintf(s_msg, sizeof(s_msg), "defaults in RAM (press 8)"); }
+    else               { snprintf(s_msg, sizeof(s_msg), "REFUSE %s", proto_err_name(r)); }
+}
+
+/* 六、绘制 */
+/* 安全写串：先过 ui_fit_chars 截断（越界 = IPS200 的 zf_assert = while(true) = 整机死机） */
+static void um_puts(uint8 row, uint8 col, const char *s)
+{
+    char t[48];
+    uint8 n = ui_fit_chars(ui_col(col), 46u);
+
+    if (0u == n) { return; }
+    if (n > 45u) { n = 45u; }
+    memcpy(t, s, n);
+    t[n] = '\0';
+    ui_puts_row(row, col, t);
+}
+
+static const char *um_bench_state_str(void)
+{
+    switch (spd_bench_state())
+    {
+        case SB_RUN:     return "RUN";
+        case SB_WAITLOG: return "WRITE";
+        case SB_DONE:    return "DONE";
+        case SB_ABORT:   return "ABORT";
+        case SB_REFUSED: return "REFUSED";
+        default:         return "IDLE";
+    }
+}
+
+/* 列表右侧那一列的值：按 kind 显示成人看得懂的词，而不是裸数字 */
+static void um_value_text(uint8 idx, char *out, uint8 size)
+{
+    float v = 0.0f, lo = 0.0f, hi = 0.0f, st = 0.0f;
+    char  t[16];
+
+    if (0u == um_read(idx, &v, &lo, &hi, &st))
+    {
+        out[0] = '-';
+        out[1] = '\0';
+        return;
+    }
+
+    switch (UM_ITEMS[idx].kind)
+    {
+        case UM_MODE:
+            if (0u != um_pb_wait()) { snprintf(out, size, "WAIT"); break; }   /* 开了但没跑起来 */
+            snprintf(out, size, "%s", (v < 0.5f) ? "OFF" : ((v > 1.5f) ? "PWR" : "PUSH"));
+            break;
+
+        case UM_PBL:
+        case UM_DFW:
+            /* 3 位小数：0.605 在小数点后第三位，2 位会显示成 0.61 让人以为改了别的数 */
+            ui_ftoa(t, sizeof(t), v, 3u);
+            snprintf(out, size, "%s m", t);
+            break;
+
+        case UM_RPS:
+            ui_ftoa(t, sizeof(t), v, 1u);
+            snprintf(out, size, "%s rps", t);
+            break;
+
+        case UM_SLOT:
+        {
+            /* 只给个 S2 等于没给信息（`ins_route_slot_info` 只读一页索引，很便宜）。 */
+            uint8                 sl = (uint8)(v + 0.5f);
+            ins_route_slot_info_t inf;
+
+            if (0u != ins_route_flash_busy()) { snprintf(out, size, "S%u SAV", (unsigned)sl); break; }
+            if ((0u == ins_route_slot_info(sl, &inf)) || (0u == inf.valid))
+            {
+                snprintf(out, size, "S%u empty", (unsigned)sl);
+                break;
+            }
+            snprintf(out, size, "S%u %upt", (unsigned)sl, (unsigned)inf.count);
+            break;
+        }
+
+        default:                                /* PF：参数原始值 */
+            ui_ftoa(t, sizeof(t), v, 3u);
+            snprintf(out, size, "%s", t);
+            break;
+    }
+}
+
+static void um_draw_list(void)
+{
+    uint8 span = (uint8)(UM_ROW_HINT - UM_ROW_ITEM0);
+    uint8 i;
+
+    ui_clear();
+
+    if (s_cur < s_top) { s_top = s_cur; }
+    if ((uint8)(s_cur - s_top) >= span) { s_top = (uint8)(s_cur - span + 1u); }
+    if (s_top > (uint8)(UM_NITEMS - 1u)) { s_top = (uint8)(UM_NITEMS - 1u); }
+
+    um_puts(UM_ROW_TITLE, 0u, "KART MENU");
+
+    for (i = 0u; i < span; i++)
+    {
+        uint8    k = (uint8)(s_top + i);
+        char     line[48];
+        char     val[16];
+        uint8    row = (uint8)(UM_ROW_ITEM0 + i);
+
+        if (k >= UM_NITEMS) { break; }
+
+        um_value_text(k, val, sizeof(val));
+        snprintf(line, sizeof(line), "%-14s %s", UM_ITEMS[k].name, val);
+        um_puts(row, 2u, line);
+    }
+
+    um_puts(UM_ROW_HINT, 0u, UM_HINT);
+
+    if (s_msg[0] != '\0') { um_puts(UM_ROW_TITLE, 0u, "KART  "); um_puts(UM_ROW_TITLE, 6u, s_msg); }
+
+    um_puts((uint8)(UM_ROW_ITEM0 + (uint8)(s_cur - s_top)), 0u, ">");
+}
+
+static void um_draw_edit(void)
+{
+    const um_item_t *it  = &UM_ITEMS[s_cur];
+    float v = 0.0f, lo = 0.0f, hi = 0.0f, st = 0.0f;
+    char  t[32];
+    char  line[48];
+
+    if (0u == um_read(s_cur, &v, &lo, &hi, &st)) { s_mode = UM_LIST; return; }
+
+    ui_clear();
+
+    um_puts(0u, 0u,  "EDIT");
+    snprintf(line, sizeof(line), "%s", it->name);
+    um_puts(1u, 0u, line);
+
+    /* 第 6/7 项显示成人话，不加单位后缀也能看懂 */
+    if (UM_MODE == it->kind)
+    {
+        if (0u != um_pb_wait())
+        {
+            /* 已使能但没跑：把 route_pb 记下的原因直接贴出来（no table / odom off …） */
+            snprintf(line, sizeof(line), "= WAIT: %s", route_pb_reason());
+            um_puts(3u, 0u, line);
+        }
+        else
+        {
+            /* 以前只写 "= OFF (pb_en=0)"，于是"切 PUSH 一闪就回 OFF"完全没线索；
+             * 现在会把 route_pb 记下的原因贴在后面（done: finish / ESTOP /
+             * drv preempted / RC ON: CH6->OFF …），一眼能分是"跑完了"还是"被挡了"。
+             */
+            if (v < 0.5f)
+            {
+                const char *rr = route_pb_reason();
+
+                if ((NULL != rr) && (0 != rr[0]))
+                {
+                    snprintf(line, sizeof(line), "= OFF: %.13s", rr);
+                    um_puts(3u, 0u, line);
+                }
+                else
+                {
+                    um_puts(3u, 0u, "= OFF  (pb_en=0)");
+                }
+            }
+            else
+            {
+                um_puts(3u, 0u, (v > 1.5f) ? "= PWR  (steer+speed)" : "= PUSH (steer only)");
+            }
+        }
+    }
+    else if (UM_RPS == it->kind)
+    {
+        ui_ftoa(t, sizeof(t), v, 2u);
+        snprintf(line, sizeof(line), "= %s rps", t);
+        um_puts(3u, 0u, line);
+    }
+    else if (UM_SLOT == it->kind)
+    {
+        snprintf(line, sizeof(line), "= S%u (now S%u)",
+                 (unsigned)(v + 0.5f), (unsigned)ins_route_slot_active());
+        um_puts(3u, 0u, line);
+    }
+    else
+    {
+        ui_ftoa(t, sizeof(t), v, 4u);
+        snprintf(line, sizeof(line), "= %s m", t);
+        um_puts(3u, 0u, line);
+    }
+
+    if (UM_MODE == it->kind)
+    {
+        /* en = pb_en 实际值；st = 回放状态(0空闲 1跑 2完成 3中止)；
+         * coast = 自由轮是否生效（1 = 两后轮 0 占空比，推得动）。
+         * step/min/max 对一个 0~2 的三态开关没有意义，直接让位给诊断。
+         */
+        /* rc = RC_Engage：0 OFF / 1 STANDBY / 2 ON / 3 FAILSAFE / 4 ESTOP。 */
+        snprintf(line, sizeof(line), "en=%u st=%u rc=%u",
+                 (unsigned)((pb_en > 0.5f) ? 1u : 0u), (unsigned)route_pb_state(),
+                 (unsigned)RC_Engage);
+        um_puts(4u, 0u, line);
+
+        /* coast 永远是 0/1 两位信息，而 idx/n 和横向误差能一眼分出 "压根没起跑"（idx 不动）和"跑了但脱线"（idx 涨、e 很大）。 */
+        snprintf(line, sizeof(line), "i%u/%u e%d c%u",
+                 (unsigned)route_pb_index(), (unsigned)ins_route_get_count(),
+                 (int)(route_pb_elat() * 100.0f), (unsigned)spd_ctrl_coast());
+        um_puts(5u, 0u, line);
+
+        /* （`%.18s` 还会从半个汉字处截断，屏幕上会糊成两行）。 所以 route_pb.c 的 pb_set_why() 也只用英文，见那里的注释。 */
+        snprintf(line, sizeof(line), "%.18s", route_pb_reason());
+        um_puts(6u, 0u, line);
+    }
+    else if (UM_SLOT == it->kind)
+    {
+        /* 选槽前必须看得见"这一槽有没有表、多少点、多长"—— 否则现场会在"7.Follow 报 no table"那里绕一圈才想到是槽选错了。 */
+        ins_route_slot_info_t inf;
+        uint8                 sl = (uint8)(v + 0.5f);
+
+        if ((0u != ins_route_slot_info(sl, &inf)) && (0u != inf.valid))
+        {
+            snprintf(line, sizeof(line), "n=%u  %u.%02u m",
+                     (unsigned)inf.count,
+                     (unsigned)(inf.lap_mm / 1000u),
+                     (unsigned)((inf.lap_mm % 1000u) / 10u));
+            um_puts(4u, 0u, line);
+            snprintf(line, sizeof(line), "ds=%u mm", (unsigned)inf.ds_mm);
+            um_puts(5u, 0u, line);
+            snprintf(line, sizeof(line), "crc %04X", (unsigned)(inf.crc_r & 0xFFFFu));
+            um_puts(6u, 0u, line);
+        }
+        else
+        {
+            um_puts(4u, 0u, "EMPTY - no table");
+            um_puts(5u, 0u, "");
+            um_puts(6u, 0u, "");
+        }
+    }
+    else
+    {
+        ui_ftoa(t, sizeof(t), st, 3u);
+        snprintf(line, sizeof(line), "step %s", t);
+        um_puts(4u, 0u, line);
+
+        ui_ftoa(t, sizeof(t), lo, 3u);
+        snprintf(line, sizeof(line), "min  %s", t);
+        um_puts(5u, 0u, line);
+
+        ui_ftoa(t, sizeof(t), hi, 3u);
+        snprintf(line, sizeof(line), "max  %s", t);
+        um_puts(6u, 0u, line);
+    }
+
+    /* 拒跑原因（REFUSE busy / no table …）也留在编辑页，别让用户"按了没反应" */
+    if (s_msg[0] != '\0') { um_puts(7u, 0u, s_msg); }
+
+    if (UM_SLOT == it->kind)
+    {
+        um_puts(8u,  0u, "K3/K4 = slot   K1 = back");
+        um_puts(9u,  0u, "(-/+ applies now)");
+    }
+    else
+    {
+        um_puts(8u,  0u, "K3/K4 = -/+");
+        um_puts(9u,  0u, "K1 = OK  K2 = Back");
+    }
+}
+
+/* 七、仪表盘字段 */
+static void dash_fmt(char *buf, uint8 size, void *ctx)
+{
+    uint8 i = *(const uint8 *)ctx;
+    char  a[16];
+    char  b[16];
+
+    switch (i)
+    {
+        case 0u:
+            ui_ftoa(a, sizeof(a), enc_l.rps, 2u);
+            ui_ftoa(b, sizeof(b), enc_r.rps, 2u);
+            snprintf(buf, size, "rps L%s R%s", a, b);
+            break;
+
+        case 1u:
+            ui_ftoa(a, sizeof(a), enc_l.rps * ins_m_per_rev, 2u);
+            ui_ftoa(b, sizeof(b), ins_odom_get_dist(), 2u);
+            snprintf(buf, size, "v~%s m/s  d=%s m", a, b);
+            break;
+
+        case 2u:
+            ui_ftoa(a, sizeof(a), ins_imu_get_yaw(), 1u);
+            ui_ftoa(b, sizeof(b), ins_odom_get_x(), 2u);
+            snprintf(buf, size, "yaw %s  x %s", a, b);
+            break;
+
+        case 3u:
+            ui_ftoa(a, sizeof(a), ins_odom_get_y(), 2u);
+            ui_ftoa(b, sizeof(b), steer.meas_delta, 2u);
+            snprintf(buf, size, "y %s  steer %s", a, b);
+            break;
+
+        case 4u:
+            snprintf(buf, size, "pb en%u %s s%u",
+                     (unsigned)(pb_en > 0.5f),
+                     (1u == route_pb_state()) ? "RUN" :
+                     ((2u == route_pb_state()) ? "DONE" :
+                      ((3u == route_pb_state()) ? "ABRT" : "idle")),
+                     (unsigned)route_pb_index());
+            break;
+
+        case 5u:
+            snprintf(buf, size, "safe %u loc%u est%u drv%u",
+                     (unsigned)spd_safety_allow(0u),
+                     (unsigned)spd_safety_local(),
+                     (unsigned)spd_safety_estop(),
+                     (unsigned)proto_drv_owner());
+            break;
+
+        case 6u:
+            snprintf(buf, size, "rc c5=%u c6=%u e%u on%u",
+                     (unsigned)RC_Raw_Ch5, (unsigned)RC_Raw_Ch6,
+                     (unsigned)RC_Engage, (unsigned)RC_Online);
+            break;
+
+        case 7u:
+            snprintf(buf, size, "bench %s s%u n%u",
+                     um_bench_state_str(), (unsigned)spd_bench_seg(),
+                     (unsigned)bench_log_count());
+            break;
+
+        case 8u:
+            snprintf(buf, size, "store%u ld%u e%u",
+                     (unsigned)bench_log_stored(),
+                     (unsigned)app_param_loaded(),
+                     (unsigned)app_param_last_err());
+            break;
+
+        default:
+            /* HDG / SRV   = CH3 二值开关选出来的模式（HDG = CH1 在控目标航向）
+             * 三个数      = CH1 / CH2 / CH3 的**原始值**
+             * t896 / ?896 = CH3 当前判高低的阈值（t = 已标定 / ? = 还没见过开关两端）
+             * 末尾的 !      = CH1/CH2 有关键通道 raw 低于有效下限（掉线）
+             * 旧代码会把它归一成 -1 当成满舵，这就是"给油就莫名打角"的来路。
+             * 所以阈值必须一起显示 —— 否则"拨了没反应"根本分不清是通道没接还是阈值不对。
+             */
+            if (0u != RC_Online)
+            {
+                snprintf(buf, size, "%s %u/%u/%u %s%u%s",
+                         (0u != RC_Hdg_Mode) ? "HDG" : "SRV",
+                         (unsigned)RC_Raw_Ch1, (unsigned)RC_Raw_Ch2,
+                         (unsigned)RC_Raw_Ch3,
+                         (0u != RC_Hdg_Cal) ? "t" : "?",
+                         (unsigned)RC_Hdg_Thr,
+                         (0u != RC_Stick_Bad) ? "!" : "");
+            }
+            else
+            {
+                snprintf(buf, size, "imu %u fl%u", (unsigned)ins_imu_link_ok(),
+                         (unsigned)ins_odom_flags());
+            }
+            break;
+    }
+}
+
+/* 八、初始化 */
+void ui_menu_init(void)
+{
+    uint8 i;
+
+    key_init(10u);
+
+    for (i = 0u; i < 10u; i++)
+    {
+        s_df[i].row    = (uint8)(1u + i);
+        s_df[i].x      = 0u;
+        s_df[i].policy = (i < 9u) ? UI_REALTIME : UI_STATIC;
+        s_df[i].format = dash_fmt;
+        s_df[i].ctx    = (void *)&s_dix[i];
+        s_df[i].cache[0] = '\0';
+    }
+
+    s_dpage.fields            = s_df;
+    s_dpage.count             = 10u;
+    s_dpage.cursor_row        = -1;
+    s_dpage.cursor_row_last   = -1;
+    s_dpage.cursor_glyph      = 0u;
+    s_dpage.cursor_glyph_last = 0u;
+    s_dpage.dirty             = 1u;
+
+    s_mode = UM_LIST;
+    s_cur  = 0u;
+    s_top  = 0u;
+    um_draw_list();
+}
+
+/* 九、主循环任务 */
+uint8 ui_menu_in_list(void) { return (UM_LIST == s_mode) ? 1u : 0u; }
+
+void ui_menu_task(void)
+{
+    uint32 now = motor_link_now_ms();
+    uint8  k1s, k2s, k3s, k4s, h3, h4;
+    int8   dir = 0;
+
+    if ((uint32)(now - s_last) < 10u) { return; }       /* 10 ms 分频 */
+    s_last = now;
+
+    /* 落盘结束那一拍自动更新提示行 —— 现场只有屏幕时，这是唯一能确认"表真写进去了"的地方 */
+    {
+        uint8 b = ins_route_flash_busy();
+
+        if ((0u != s_savlast) && (0u == b))
+        {
+            uint8 rc = ins_route_flash_last_rc();
+
+            snprintf(s_msg, sizeof(s_msg), "SAVE %s n=%u rc=%u",
+                     (1u == rc) ? "ok" : "FAIL",
+                     (unsigned)route_app_count(), (unsigned)rc);
+            if (UM_LIST == s_mode) { um_draw_list(); }
+        }
+        s_savlast = b;
+    }
+
+    key_scanner();
+
+    k1s = (KEY_SHORT_PRESS == key_get_state(KEY_1)) ? 1u : 0u;
+    k2s = (KEY_SHORT_PRESS == key_get_state(KEY_2)) ? 1u : 0u;
+    k3s = (KEY_SHORT_PRESS == key_get_state(KEY_3)) ? 1u : 0u;
+    k4s = (KEY_SHORT_PRESS == key_get_state(KEY_4)) ? 1u : 0u;
+    h3  = (KEY_LONG_PRESS  == key_get_state(KEY_3)) ? 1u : 0u;
+    h4  = (KEY_LONG_PRESS  == key_get_state(KEY_4)) ? 1u : 0u;
+
+    if (0u != k1s) { key_clear_state(KEY_1); }
+    if (0u != k2s) { key_clear_state(KEY_2); }
+
+    if (0u != k3s)      { key_clear_state(KEY_3); s_rep3 = 0u; dir = 1; }
+    else if (0u != h3)  { s_rep3++; if (s_rep3 >= 10u) { s_rep3 = 0u; dir = 1; } }
+    else                { s_rep3 = 0u; }
+
+    if (0u != k4s)      { key_clear_state(KEY_4); s_rep4 = 0u; dir = -1; }
+    else if (0u != h4)  { s_rep4++; if (s_rep4 >= 10u) { s_rep4 = 0u; dir = -1; } }
+    else                { s_rep4 = 0u; }
+
+    /* ---------- DASH ---------- */
+    if (UM_DASH == s_mode)
+    {
+        if ((0u != k1s) || (0u != k2s)) { s_mode = UM_LIST; um_draw_list(); return; }
+        ui_page_render(&s_dpage, 0u);
+        return;
+    }
+
+    /* ---------- EDIT ---------- */
+    if (UM_EDIT == s_mode)
+    {
+        float v = 0.0f, lo = 0.0f, hi = 0.0f, st = 0.0f;
+        uint8 has = um_read(s_cur, &v, &lo, &hi, &st);
+
+        if ((0 != dir) && (0u != has) && (UM_RPS == UM_ITEMS[s_cur].kind))
+        {
+            uint8 g = um_gear_of(v);
+
+            g = (uint8)((dir > 0) ? ((g + 1u) % UM_PWR_NGEAR)
+                                  : ((g + (UM_PWR_NGEAR - 1u)) % UM_PWR_NGEAR));
+            um_write(s_cur, UM_PWR_GEAR[g]);
+            has = um_read(s_cur, &v, &lo, &hi, &st);
+        }
+        else if ((0 != dir) && (0u != has) &&
+                 ((UM_PBL == UM_ITEMS[s_cur].kind) || (UM_DFW == UM_ITEMS[s_cur].kind)))
+        {
+            /* 上位机/App 可能写过 0.63 这种中间值，吸附过去才不丢信息。 */
+            const float *arr = (UM_PBL == UM_ITEMS[s_cur].kind) ? UM_PBL_CHOICE : UM_DFW_CHOICE;
+            uint8        n   = (UM_PBL == UM_ITEMS[s_cur].kind) ? UM_PBL_N      : UM_DFW_N;
+            uint8        g   = um_nearest(v, arr, n);
+
+            g = (uint8)((dir > 0) ? ((g + 1u) % n) : ((g + (n - 1u)) % n));
+            um_write(s_cur, arr[g]);
+            has = um_read(s_cur, &v, &lo, &hi, &st);
+
+            /* 改完立刻回读一次并留一行提示：这两个数会改变"车按表走出来的形状"， */
+            snprintf(s_msg, sizeof(s_msg), "%s = %.3f m",
+                     (UM_PBL == UM_ITEMS[s_cur].kind) ? "pb_l" : "df_w", v);
+        }
+        else if ((0 != dir) && (0u != has))
+        {
+            v += ((dir > 0) ? st : -st);
+
+            /* 按步长吸附：避免 0.1 反复加减后变成 1.1999999。 往小走时 (int)(-0.5) 朝 0 截断 ⇒ 每次少走一格，表现为"往下按不动"。 */
+            if (st > 1.0e-6f)
+            {
+                v = lo + ((float)(int)(((v - lo) / st) + 0.5f)) * st;
+            }
+            if (v < lo) { v = lo; }
+            if (v > hi) { v = hi; }
+            um_write(s_cur, v);
+
+            has = um_read(s_cur, &v, &lo, &hi, &st);    /* 以"真正生效的值"为准重读 */
+        }
+
+        if ((0u != k1s) || (0u != k2s)) { s_mode = UM_LIST; um_draw_list(); return; }
+
+        /* 只在值真的变了才重画（含外部改动：被拒时 pb_en 会被按回 0） */
+        if ((0u != has) && ((v > (s_edit_v + 1.0e-4f)) || (v < (s_edit_v - 1.0e-4f))))
+        {
+            s_edit_v     = v;
+            s_edit_dirty = 1u;
+        }
+        if (0u != s_edit_dirty)
+        {
+            s_edit_dirty = 0u;
+            um_draw_edit();
+        }
+        return;
+    }
+
+    /* ---------- LIST ---------- */
+    if (0 != dir)
+    {
+        s_cur = (uint8)((s_cur + UM_NITEMS + ((dir > 0) ? UM_DIR_SIGN : -UM_DIR_SIGN)) % UM_NITEMS);
+        um_draw_list();
+        return;
+    }
+
+    if (0u != k1s)
+    {
+        const um_item_t *it = &UM_ITEMS[s_cur];
+
+        s_msg[0] = '\0';
+
+        if (UM_ACT != it->kind)
+        {
+            s_mode       = UM_EDIT;
+            s_msg[0]     = '\0';
+            s_edit_dirty = 1u;
+            s_edit_v     = 1.0e30f;         /* 强制第一帧一定画 */
+            um_draw_edit();
+            return;
+        }
+        if (0 != it->act)       { it->act(); }
+        um_draw_list();
+        return;
+    }
+
+    if (0u != k2s) { s_mode = UM_DASH; ui_page_mark_dirty(&s_dpage); return; }
+
+    /* 跑班进行中：每 200 ms 只刷标题行（SPI 开销极小） */
+    if ((SB_RUN == spd_bench_state()) || (SB_WAITLOG == spd_bench_state()))
+    {
+        if ((uint32)(now - s_stlast) >= 200u)
+        {
+            char line[32];
+
+            s_stlast = now;
+            snprintf(line, sizeof(line), "%s seg%u %u/%u",
+                     um_bench_state_str(), (unsigned)spd_bench_seg(),
+                     (unsigned)(spd_bench_step() + 1u), (unsigned)spd_bench_nsteps());
+            um_puts(UM_ROW_TITLE, 0u, line);
+        }
+    }
+}

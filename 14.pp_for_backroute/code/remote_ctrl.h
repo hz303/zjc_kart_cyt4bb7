@@ -1,0 +1,199 @@
+/* 遥控（HotRc 枪式遥控器 / 逐飞 UART 接收机 + SBUS 帧）
+ * 本文件把那套"标定值 + 接管状态机"照搬过来，**换成走本工程的接口**：
+ * 数据源            uart_receiver 快照(UART_4/P14_0, SBUS)   同一个（驱动逐飞库里就有）
+ * 方向盘            Servo_Target_Deg                         steer.target_delta / steer_en_cmd
+ * 后轮              Motor_LR_Crtl.target / Motor_RR_Crtl.target   spd_target_l / spd_target_r
+ * 使能              Servo_Crtl_Enable / Motor_Crtl_Enable    steer_en_cmd / spd_safety_set_local()
+ * 页面              Remote_Crtl_Page()（IPS200 菜单里的一项）  **没有页面** —— 见下
+ * CH1  摇杆    方向盘（左右）                  -> RC_Steer_Deg
+ * CH2  扳机    油门（前后）                    -> RC_Throttle
+ * · CH3 百分比 **≤50** ⇒ **CH1 改为控制航向**（CH1 回中 = 保持当前航向）
+ * · CH3 百分比 **>50**  ⇒ 恢复原用途：CH1 控制舵机转角
+ * · 步长（CH1 打满 = ±20°，按档位量化）：
+ * CH3 0~14%  → 0.2°
+ * CH3 15~24% → 0.5°
+ * CH3 25~50% → 1.0°
+ * CH4  三档    **空置**（油门行程在发射机侧缩放） -> RC_Scale 恒 1.0
+ * CH5  二值    急停                            -> RC_Estop（锁存，见下）
+ * CH6  二值    使能 / 接管                     -> 接管状态机的合闸开关
+ * 开关极性（192 = 低档 / 1792 = 高档，实测标定值）：
+ * CH5 急停   ：`RC_ESTOP_ACTIVE_HIGH = 1` -> **打到高档 = 急停生效**
+ * CH6 使能   ：`RC_ARM_ACTIVE_HIGH   = 1` -> **打到高档 = 允许接管**
+ * 改用**发射机上的两个开关**：
+ * 合闸条件（三条同时满足）：CH6 打到高档  且  接收机在线(ST=1)  且  参数 `rc_arm_en` = 1
+ * 合闸后：先进 STANDBY（双环使能、目标 0，让人看清方向盘回中）-> 油门回中才升 ON
+ * CH6 收回 / 上位机把 `rc_arm_en` 写 0 -> 立刻回到 OFF（全部失能、目标 0）
+ * `RC_ESTOP_ACTIVE_HIGH = 1` 时，CH5 打到高档即急停生效。生效后：
+ * ① 后轮：`spd_safety_set_estop(1)` -> 保护层把输出**无条件钉 0**（SAFE_BIT_ESTOP，**不可被本地接管替换**）；
+ * ② 转向：`steer_ctrl_set_estop(1)` -> 内环强制失能、输出钉 0；
+ * ③ 遥控自己的目标全部清零、本地接管档位放掉。
+ * ⇒ **就算此刻是 WiFi 上位机在开车，拨一下 CH5 也能把车停住。** 这是刻意做的：
+ * "至少要有一种手段能控制住车辆"，遥控不该只在"它自己接管时"才有用。
+ * 保护层有三道"上位机在场"的门（没收到过下行帧 / 没有使能位 / 链路离线），
+ * SPI 没插的时候它们会把电机**永久锁死且不报错**。所以：
+ * 遥控进入 ON / STANDBY 时 -> `spd_safety_set_local(1)`，把这三道门换成"本地授权"；
+ * 退出 / 失控 / 急停          -> `spd_safety_set_local(0)`，完整五道门原样恢复。
+ * 两条路合起来正好是「**WiFi 在场 OR 遥控在场**」，都不会出力的情形只有"两个都不在"。
+ * ⇒ **喂心跳是硬约束**：谁能把后轮闭环转起来，谁就得每圈喂 `spd_safety_heartbeat()`。
+ * `RC_THR_TARGET_FWD = 10.0` 换算过来只有约 **0.54 rps**（cpr=1858）。
+ * 本工程 `spd_ctrl` 的目标量纲是 **rps**，所以这里用 `rc_thr_max`（默认 2.0 rps）表达满杆，
+ * 再乘 CH4 旋钮的缩放，最后夹一次 `spd_target_max`。
+ */
+
+#ifndef _REMOTE_CTRL_H
+#define _REMOTE_CTRL_H
+
+#include "zf_common_headfile.h"
+
+/* 一、通道分配 */
+#define RC_CH_STEER             (0)             /* CH1 摇杆   → 方向盘；CH3 打到"低"时改控目标航向 */
+#define RC_CH_THROTTLE          (1)             /* CH2 扳机   → 前后油门 */
+#define RC_CH_STEER_TRAVEL      (2)             /* CH3 **二值**开关 → 模式：低=航向 / 高=舵机角 */
+#define RC_CH_THR_TRAVEL        (3)             /* CH4 三档开关 → **空置**（行程在发射机侧缩放） */
+#define RC_CH_ESTOP             (4)             /* CH5 二值   → 急停 */
+#define RC_CH_ARM               (5)             /* CH6 二值   → 使能/接管 */
+
+/* 开关极性：192 = 低档, 992 = 中位, 1792 = 高档（下同）。 */
+#define RC_ESTOP_ACTIVE_HIGH    (1)             /* 1 = CH5 高档急停生效；0 = 低档生效 */
+#define RC_ARM_ACTIVE_HIGH      (1)             /* 1 = CH6 高档允许接管；0 = 低档 */
+
+#define RC_STEER_MID            (992)
+#define RC_STEER_MIN            (192)
+#define RC_STEER_MAX            (1792)
+
+#define RC_THR_MID              (992)
+#define RC_THR_MIN              (192)
+#define RC_THR_MAX              (1792)
+
+/* 开关档位原始值（CH5/CH6 两态；CH3/CH4 是旋钮，用上面三个极值做满幅换算） */
+#define RC_SW_VAL_LOW           (192)
+#define RC_SW_VAL_MID           (992)
+#define RC_SW_VAL_HIGH          (1792)
+
+/* 方向盘极性：+1 = 原始值增大 = "向右"。实测方向相反就改 -1。 */
+#define RC_STEER_DIR_SIGN       (+1)
+
+/* 中位死区（原始计数）：|CH - 992| 不超过它就算 0。
+ * 方向盘用它把"没碰杆子时的零点漂移"直接压成 0 度。
+ * （换算：方向盘 ±0.27°（满 27°）；油门 ±0.02 rps（满杆默认 2 rps））。
+ */
+#define RC_STEER_DEADBAND       (8)
+#define RC_THR_DEADBAND         (8)
+
+/* 症状：车不动时 target_l/target_r 恒 **-0.06 rps**。
+ * 算式：(968-992)/800 = -0.03 的归一化油门 × rc_thr_max(2.0) = **-0.06** —— 一个计数都对得上。
+ * 根因不是"忘设死区"，而是**死区只有 ±8，而这只发射机的中位偏了 24**。
+ * 死区加大能压住，但换一支发射机/重新微调就又偏 ⇒ 改成**学中位**，死区继续 ±8。
+ * 学习规则（两段）：
+ * ① 开机捕获：前 20 帧内，若 raw 落在 992±80 里 ⇒ 直接把它当"静止位"锁下来（上电时手不会按着杆）；
+ * ② 慢跟踪：之后每 100 ms 最多挪 1 个计数，只在 |raw - mid| ≤ 40（"看着像中位"）时才挪
+ * ⇒ 24 个计数约 2.4 s 收敛；而**推杆**（几百计数）永远在 40 之外，不会被当成中位漂移学掉。
+ */
+#define RC_MID_CAP_BAND         (80)        /* 开机捕获：|raw - 标称中位| 允许多大 */
+#define RC_MID_TRACK_BAND       (100)       /* 慢跟踪：只有"看着像中位"才允许挪。 静止值的偏差落在跟踪带外 ⇒ 永远修不回来（死锁）。 */
+#define RC_MID_TRACK_STEP       (1)         /* 慢跟踪：每次最多挪几个计数 */
+#define RC_MID_TRACK_MS         (100u)      /* 慢跟踪：多久挪一次（1 计数/100ms） */
+
+/* 油门满杆对应的目标转速 rps（在线可改，见参数表 rc_thr_max）。 第一次上车请按 01-上电标定卡.md 从小往大加。 */
+#define RC_THR_MAX_DEFAULT      (2.0f)
+
+/* · 行程旋钮在**发射机**上，接收机收到的 CH2 已经缩过 ⇒ 代码再乘一次就是平方；
+ * · 所以 CH4（三档开关）**空置**，不承担任何功能；
+ * · 想调快慢：拧发射机旋钮，或改 rc_thr_max(28)；临时限速用 pb_vmax / 菜单 7.Speed。
+ */
+#define RC_SCALE_MIN            (0.20f)
+#define RC_SCALE_MAX            (1.00f)
+
+/* CH1  摇杆（回中）    方向盘；CH3 打到"低"时它改控**目标航向**
+ * CH2  扳机（回中）    油门
+ * CH3  **二值**开关    低 = 航向模式 / 高 = 舵机角度模式
+ * CH4  **三档**开关    **空置**（油门行程由发射机上的旋钮缩放，代码不该再乘一遍）
+ * CH5  二值            急停（高 = 急停）
+ * CH6  二值            接管/使能
+ * 代码读不到它，只看到 CH1 摆不到两端。归一化按 192~1792 算，所以缩了以后
+ * 有效舵量跟着变小 —— 这是对的，**不要补偿**。
+ * 目的：把"舵机由摇杆直接给角"临时改成"摇杆给目标航向"，**一根摇杆**就能做两件事：
+ * · 回中（CH1 在死区内）⇒ 目标航向 = 松手那一刻的航向 ⇒ 车**主动保持**这个航向（看蛇形）
+ * · 往左/右推          ⇒ 目标航向 = 基准 ± 偏移（≤ ±20°）⇒ 台阶测试的一个"台阶"
+ * 判据（现场）：推右 ⇒ 车头向右偏；松手 ⇒ 方向盘回中、航向钉住不动。
+ * 松手就回到原航向，测不了台阶；松手取基准 = 摇杆变成"相对当前航向的微调"。
+ */
+#define RC_HDG_MAX_DEG          (20.0f)     /* CH1 打满对应的航向偏移上限（±） */
+#define RC_HDG_KP               (2.20f)     /* 航向环增益 deg/deg（= PP 在 ld≈0.6 m 时的 2L/ld） */
+#define RC_HDG_STEP             (0.5f)      /* 偏移量化步长 deg（20/0.5 = 40 格） */
+
+/* 192~1792 之外 ⇒ 归一化算出 -1.24 被夹到 -1 ⇒ **满舵 / 满倒车**。 现场症状就是"CH1=0 时一给油，方向盘莫名其妙打一个角"。 */
+#define RC_CH_VALID_MIN         (120)
+
+/* 现场三种接法都出现过：
+ * · 低 192 / 高 1792  —— 标准 SBUS 量程
+ * · 低 0   / 高 1792  —— 个别接收机把"该档"发成 0（会被 RC_CH_VALID_MIN 判成掉线）
+ * · 低 992 / 高 1792  —— 开关只用到中/高两档
+ * 写死一个阈值只能覆盖其中一种，另两种的症状**完全一样**："CH3 拨到低，还是舵机角模式"。
+ * 做法：自己记 min/max；见过高位（>1200）且跨度 ≥400 才标定，阈值取中点。
+ * 没标定（通道根本没接）时保持舵机角模式 —— 那是最保守的行为。
+ */
+#define RC_HDG_HYST             (60u)       /* 阈值滞环（计数）：防开关在临界点抖动时模式来回翻 */
+
+/* 合闸判定：油门归一化值不超过它才允许从 STANDBY 升到 ON（防止合闸瞬间全油门窜车） */
+#define RC_ARM_THR_NEUTRAL      (0.05f)
+
+/* 四、接管状态机 */
+#define RC_ENGAGE_OFF           (0)     /* 全部失能、目标 0（开关收回 / 未授权） */
+#define RC_ENGAGE_STANDBY       (1)     /* 双环使能、目标 0（刚合闸，等油门回中） */
+#define RC_ENGAGE_ON            (2)     /* 双环使能 + 遥控设置目标（真正接管） */
+#define RC_ENGAGE_FAILSAFE      (3)     /* 失控挂起：转向失能；后轮目标 0（锁存） */
+#define RC_ENGAGE_ESTOP         (4)
+
+/* 五、对外数据（都由 remote_ctrl_update() / remote_ctrl_apply() 刷新） */
+extern volatile uint16  RC_Raw_Ch1;         /* CH1 原始值（标定/显示用） */
+extern volatile uint16  RC_Raw_Ch2;         /* CH2 原始值 */
+extern volatile uint16  RC_Raw_Ch3;         /* CH3 原始值（航向微调档位旋钮） */
+extern volatile uint16  RC_Raw_Ch4;         /* CH4 原始值（油门行程旋钮） */
+extern volatile uint16  RC_Raw_Ch5;         /* CH5 原始值（急停开关） */
+extern volatile uint16  RC_Raw_Ch6;         /* CH6 原始值（使能开关） */
+extern volatile float   RC_Steer_Deg;       /* 方向盘指令角（度，向右为正；已夹在 ±27 内） */
+extern volatile float   RC_Steer_Norm;      /* CH1 归一化 -1~+1（已过中位死区） */
+extern volatile uint8   RC_Ch3_Pct;         /* CH3 二值：0 = 低(航向) / 100 = 高(舵机) */
+extern volatile uint8   RC_Stick_Bad;       /* 通道掉线位图 bit0=CH1 bit1=CH2 bit2=CH3（raw 过低） */
+extern volatile uint16  RC_Thr_Mid;
+extern volatile uint16  RC_Steer_Mid;
+extern volatile uint8   RC_Hdg_Mode;        /* 1 = CH1 正在控制航向；0 = 控制舵机角 */
+extern volatile uint16  RC_Hdg_Thr;         /* CH3 当前判高/低的阈值（运行时自适应） */
+extern volatile uint8   RC_Hdg_Cal;         /* 1 = CH3 已经标定过（见过开关两端） */
+extern volatile float   RC_Hdg_Step;        /* 步长 deg（现固定 0.5） */
+extern volatile float   RC_Hdg_Off;         /* 当前航向偏移 deg（已量化、已夹 ±20） */
+extern volatile float   RC_Cmd_Yaw;         /* 航向模式下的目标航向 deg（= 基准 + 偏移） */
+extern volatile float   RC_Throttle;        /* 归一化油门 -1.0 ~ +1.0（前进为正） */
+extern volatile float   RC_Scale;           /* CH4 旋钮算出的速度缩放 0~1 */
+extern volatile uint8   RC_Estop;           /* 1 = 急停开关生效 */
+extern volatile uint8   RC_Arm;             /* 1 = 使能开关合闸 */
+extern volatile uint8   RC_Online;          /* 1 = 接收机报告状态正常（未失控） */
+extern volatile uint8   RC_Engage;          /* 接管状态，取 RC_ENGAGE_* */
+extern volatile uint32  RC_Frames;          /* 累计收到的完整 SBUS 帧数（不涨 = 接收机/接线问题） */
+extern volatile float   RC_Target_Rps;      /* 本拍算出来的后轮目标 rps（带缩放） */
+
+/* 遥控总开关：1 = 允许遥控接管（上位机可一键禁掉，避免和调参抢车） */
+extern volatile float   rc_arm_en;
+/* 油门满杆目标 rps（在线可改） */
+extern volatile float   rc_thr_max;
+
+/* 六、接口 */
+/* 初始化：初始化接收机（UART_4 / P14.0，SBUS 100 kbps）+ 清状态。
+ * 注意：必须在 5ms PIT 中断起来之前调用（接收机的帧间隔计时用 TC_TIME2_CH2）。
+ */
+void    remote_ctrl_init    (void);
+
+/* 主循环每圈调一次：读 uart_receiver 快照 -> 换算成有物理含义的指令量（纯算术，可忽略开销） */
+void    remote_ctrl_update  (void);
+
+/* 主循环每圈调一次（在 update 之后）：跑接管状态机 + 写目标 + 推急停/本地接管档位 */
+void    remote_ctrl_apply   (void);
+
+/* 立刻解除接管（把两环失能、目标清零、急停与本地档位都放开）。上电/停机路径调用。 */
+void    remote_ctrl_release (void);
+
+/* 急停是否生效（供 1Hz 打印/遥测；真实输出已经被保护层钉住，这里只是回读） */
+uint8   remote_ctrl_estop   (void);
+
+#endif

@@ -1,0 +1,35 @@
+/* 这是"上电时把哪几张表补进哪几个槽"的清单。真正的表体在**生成物**里：
+ * tools/route_to_carbin.py <route.json> --outdir <d> --cname ins_route_builtin_xxx
+ * -> <d>/ins_route_builtin_xxx.c      （拷到本目录，加进 CM7_0 工程）
+ * （实现见 `ins_route_slot_load_image()` + `main_cm7_0.c` 的上电块）。
+ * 只在空槽时补 ⇒ **永远不会抢用户的表**，也不会在每次上电把下载的表盖掉。
+ * ---- 工程 10 的槽位分工（`flash_map.h` 是权威）---------------------------------------
+ * 槽 0  手推录制（菜单 RtSaveF 只写它；协议层禁止从 PC 写 0）
+ * 槽 1  电子制图 · **正式赛道**（PC 灌表，或内建）
+ * 槽 2  电子制图 · **调试用**（内建圆环 / 短表）—— 调控制系统时的"确定正确"靶子
+ * 槽 3  实际轨迹记录（回放时存真实轨迹）
+ * `ins_route_flash_save_slot()` 写槽时**顺手把该槽设为 active**
+ * ⇒ 表里**最后一个真正写下去的**那张会成为上电默认选中的表。
+ * 卡丁的赛道还没定（要等 ASC 电子图 / 现场手推），而且**点距从 20 mm 改成了 50 mm**，
+ * 工程 8 那两张表（C 车尺度：40.8 m）**不能直接搬过来**。
+ * ⇒ 电子制图这条路现在走 **`route_link` 串口灌表**（不用重编固件，见 `route_link.h`），
+ * 等赛道定了再决定要不要把某张表编进固件。
+ * 加一张内建表的做法：(1) 生成 `.c` 并拷进本目录；(2) 加进 CM7_0 的 IAR 工程；
+ * (3) 在下面 `ins_route_builtin_tbl[]` 里加一行；(4) 把 `ins_route_builtin_cnt` 改成实际条数。
+ */
+#include "zf_common_headfile.h"
+#include "ins_route.h"
+
+/* ---- 生成物里的符号（每张表一对；文件名 = 符号前缀）----
+ * 例：
+ * extern const uint32 ins_route_builtin_ring_len;
+ * extern const uint8  ins_route_builtin_ring_img[];
+ */
+
+/* 数组留一个占位元素，是为了避免某些编译器对"零长度数组"报错 （标准 C 不允许 `[] = {}`，IAR 在严格模式下也不收）。 */
+const ins_route_builtin_t ins_route_builtin_tbl[] =
+{
+    { (uint8)0xFFu, "none", 0, 0 },     /* 占位；`cnt = 0` ⇒ 永远不会被用到 */
+};
+
+const uint32 ins_route_builtin_cnt = 0u;
